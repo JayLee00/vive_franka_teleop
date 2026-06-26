@@ -1,0 +1,43 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+
+Visualization Manager:
+  Class: ""
+  Global Options:
+    Fixed Frame: vive_world
+    Background Color: 36; 36; 36
+    Frame Rate: 30
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Plane Cell Count: 20
+      Cell Size: 0.5
+      Color: 120; 120; 120
+      Reference Frame: vive_world
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Show Names: true
+      Show Axes: true
+      Marker Scale: 0.3
+    - Class: rviz_default_plugins/MarkerArray
+      Name: ViveMarkers
+      Enabled: true
+      Topic:
+        Value: /vive/markers
+        Depth: 5
+        Reliability Policy: Reliable
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 4.0
+      Focal Point: {X: 0, Y: 0, Z: 1.0}
+      Pitch: 0.5
+      Yaw: 0.785

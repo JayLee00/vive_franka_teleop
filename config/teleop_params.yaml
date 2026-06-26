@@ -1,0 +1,8 @@
+/**:
+  ros__parameters:
+    arms: "left,right"
+    rate_hz: 100.0
+    pos_scale: 1.0
+    pose_timeout: 0.3
+    reliable: true
+    auto_engage: false  # 키보드 클러치로 수동 제어 (space=정지 / 1=재개). auto면 정지가 즉시 취소됨

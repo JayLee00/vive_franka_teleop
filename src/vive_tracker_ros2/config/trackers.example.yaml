@@ -1,0 +1,15 @@
+# Example tracker → friendly-name mapping.
+# Get serials by running: ros2 run vive_tracker_ros2 list_devices
+#
+# Pass with `--ros-args -p tracker_name_map:='["LHR-XXXXXXXX:right_hand"]'`
+# or load via a yaml params file.
+
+vive_tracker_node:
+  ros__parameters:
+    rate_hz: 100.0
+    frame_id: vive_world
+    publish_tf: true
+    require_trackers: true
+    tracker_name_map:
+      - "LHR-XXXXXXXX:right_hand"
+      - "LHR-YYYYYYYY:left_hand"

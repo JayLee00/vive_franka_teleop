@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ROS2 / colcon (워크스페이스는 ~/franka_ros2_ws 에서 빌드)
+build/
+install/
+log/
+
+# 서드파티 vendored 클론 (231M, 자체 .git, legacy 전용)
+vendor/

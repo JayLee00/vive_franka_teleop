@@ -1,0 +1,8 @@
+# 매핑: tracker_1(LHR-7B9A3BA9) -> right arm,  tracker_2(LHR-F4A94AD1) -> left arm
+/**:
+  ros__parameters:
+    tracker_name_map: "LHR-7B9A3BA9:right,LHR-F4A94AD1:left"
+    require_devices: false
+    publish_tf: true
+    frame_id: "vive_world"
+    rate_hz: 60.0

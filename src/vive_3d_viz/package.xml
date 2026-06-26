@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>vive_3d_viz</name>
+  <version>0.1.0</version>
+  <description>HTC Vive Tracker 3.0 + Lighthouse base stations 3D visualization via SteamVR/OpenVR.</description>
+  <maintainer email="jay.lee@kist.re.kr">Jay Lee</maintainer>
+  <license>MIT</license>
+
+  <depend>rclpy</depend>
+  <depend>geometry_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>tf2_ros</depend>
+
+  <exec_depend>python3-openvr</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
