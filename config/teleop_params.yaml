@@ -6,3 +6,11 @@
     pose_timeout: 0.3
     reliable: true
     auto_engage: false  # 키보드 클러치로 수동 제어 (space=정지 / 1=재개). auto면 정지가 즉시 취소됨
+    # --- 절대 EE 타겟 (제어PC 신규 계약: /franka_<r|l>/ee_target_world) ---
+    publish_ee_target: true
+    ee_scale: 1.0        # 트래커 이동량 -> 로봇 이동량 스케일 (1.0 = 1:1)
+    ee_timeout: 0.5      # s; /franka/ee_pose_<r|l> 가 이보다 오래되면 앵커 캡처 안함
+    # R_align: 트래커 쥔 방향 <-> 로봇 프레임 정렬 회전 (row-major 3x3). 기본 단위행렬.
+    # 첫 가동 시 팔이 반대/뒤틀린 방향으로 가면 이 값을 조정 (문서 §5).
+    r_align_right: [1.0, 0.0, 0.0,  0.0, 1.0, 0.0,  0.0, 0.0, 1.0]
+    r_align_left:  [1.0, 0.0, 0.0,  0.0, 1.0, 0.0,  0.0, 0.0, 1.0]
