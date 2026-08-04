@@ -47,6 +47,8 @@ CONFIGS: dict[str, list[str]] = {
     # (noise30 과 묶으면 알고리즘 효과와 증강 효과가 섞여 비교가 안 된다)
     "dit":             ["--algo", "dp_dit"],
     "bc":              ["--algo", "bc_mlp"],
+    # base 가 lr 1e-4 에서 ep125 쯤 정체했다 → 더 큰 lr 로 같은 예산 안에서 더 갈까
+    "lr3e4":           ["--lr", "3e-4"],
 }
 
 

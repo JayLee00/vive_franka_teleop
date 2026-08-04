@@ -22,9 +22,23 @@
 | `dp_model.py` | U-Net / DiT 디노이저, BC 기준선, DDPM·DDIM, EMA |
 | `train.py` | preflight / overfit / smoke / full |
 | `eval_rollout.py` | 홀드아웃 open-loop rollout, 관절별 MAE, 플롯 |
-| `sweep.py` | 설정 비교 (정규화·모델·알고리즘) |
+| `sweep.py` | 설정 비교 (정규화·모델·알고리즘·관찰 히스토리) |
+| `deploy_sweep.py` | 배포 설정 비교 (exec_horizon · temporal ensembling · DDIM 스텝) |
+| `bench_latency.py` | 추론 지연 측정 → 제어 Hz·청킹이 실현 가능한지 판단 |
+| `make_table.py` | 스윕 결과 → 마크다운 표 (`BASELINES.md` 삽입) |
+| `launch_train.sh` | tmux 세션으로 본 학습 띄우기 + 파일 로그 |
 | `run.py` | ROS2 실기 배포 (청킹·제어 Hz·안전 가드) |
+| `RESULTS.md` | **결과 요약 — 여기부터 읽으면 된다** |
 | `BASELINES.md` | SOTA 후보 정리 + 실측 비교 + 다음 수 |
+
+## 빠른 시작
+
+```bash
+./launch_train.sh runs/my_run 300 --lr 3e-4      # tmux 로 학습 (붙기: tmux attach -t dp_lemon)
+python3 eval_rollout.py --ckpt runs/my_run/best.pt --action_steps 1
+python3 deploy_sweep.py --ckpt runs/my_run/best.pt
+python3 bench_latency.py --ckpt runs/my_run/best.pt
+```
 
 ## 학습
 
