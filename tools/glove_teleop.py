@@ -50,14 +50,15 @@ DRY_RUN = False                # True = 핸드 타겟 미발행 (값만 확인, 
 AUTO_SERVO_ON = True           # 시작 시 cmd_mode=1(position) + cmd_servo=True 발행
 SERVO_OFF_ON_EXIT = False      # 종료 시 서보 끔 (True면 손 힘 풀림 = 물체 떨굼 주의)
 RAMP_SEC = 2.0                 # 현재 손자세 → 글러브 타겟으로 서서히 이동 [s]
-MAX_STEP = 100.0               # 1주기당 관절 최대 변화 [count] (100Hz×100 = 10000 count/s)
-                               #   글리치만 걸러내는 값. 손이 굼뜨면 올리세요.
-EMA_ALPHA = 0.3                # 저역통과 (1.0 = 필터 없음 완전 그대로, 낮출수록 부드럽게)
-                               #   글러브 노이즈 실측 std ≈ 20 count → 기본 0.3
-STALE_SEC = 0.5                # 이 시간 이상 글러브 수신 없으면 타겟 홀드
+                               #   ★ 프로세스 기동 후 "최초 1회만" 태운다.
+                               #   USB 재연결이나 발판 재engage 에서는 다시 태우지 않는다
+                               #   (재연결마다 램프를 다시 태우면 그때마다 2초간 손이 굼떠진다).
+                               #   0 = 램프 없음(서보 켜는 순간 글러브 자세로 즉시 점프 — 주의)
+STALE_SEC = 0.5                # (미사용 — _process 가 프레임 수신 시에만 호출되므로 불필요)
 READ_ERR_TOLERANCE = 20        # 연속 read 오류 이 횟수까지는 포트를 닫지 않음(재오픈=보드리셋=공백 방지)
-RECONNECT_SEC = 1.0            # USB 끊기면 이 주기로 재연결 시도 (0 = 재연결 안 함)
-                               #   재연결 성공 시 램프를 다시 태워 튐 방지
+RECONNECT_SEC = 0.1            # USB 끊기면 이 주기로 재연결 시도 (0 = 재연결 안 함)
+                               #   글러브 USB 가 물리적으로 잘 끊기므로(커널 urb -32) 짧게 잡아
+                               #   끊김 비용을 최소화한다. 램프는 다시 태우지 않는다.
 
 # ── 3. 표시 ────────────────────────────────────────────────────────────────
 PRINT_HZ = 2.0                 # 상태 출력 주기 [Hz], 0 = 끔
@@ -157,7 +158,7 @@ def open_serial(port: str):
             pass
         ser.open()
         ser.reset_input_buffer()
-        time.sleep(0.3)
+        time.sleep(0.05)         # 열린 직후 남은 조각만 버린다 (dtr=False 라 보드 리셋이 없어 길게 잘 필요 없음)
         ser.reset_input_buffer()
         return ser
     except (OSError, serial.SerialException):
@@ -217,10 +218,11 @@ class GloveTeleop(Node):
             else:
                 self.get_logger().warn("글러브 미연결 — USB 꽂으면 자동 연결됩니다 (대기 중)")
 
-        self.g_ema = None        # 필터된 글러브값
-        self.last_target = None  # 직전 발행 타겟 (rate limit 기준)
-        self.start_pose = None   # 램프 시작 자세
+        self.g_last = None        # 마지막으로 받은 글러브 raw 값 (필터 없음)
+        self.last_target = None   # 직전 발행 타겟
+        self.start_pose = None    # 램프 시작 자세
         self.t_start = None
+        self.ramp_done = False    # 램프를 한 번 끝냈으면 재연결/재engage 에서 다시 태우지 않는다
         self.last_rx = 0.0
         self.t_reconnect = 0.0
         self.read_err = 0        # 연속 read 오류 횟수 (일시적 오류로 포트 닫지 않게)
@@ -243,7 +245,8 @@ class GloveTeleop(Node):
         self._reader.start()
 
         # 발행은 리더 스레드가 프레임마다 즉시 수행(최대 Hz). 타이머는 재연결 유지·상태표시만.
-        self.create_timer(0.5, self._maintain)
+        # 재연결 감지 주기: USB 가 자주 끊기므로 짧게(0.1s) 돌려 복구 지연을 줄인다.
+        self.create_timer(0.1, self._maintain)
         if PRINT_HZ > 0:
             self.create_timer(1.0 / PRINT_HZ, self._print_status)
 
@@ -277,16 +280,19 @@ class GloveTeleop(Node):
         return True
 
     def _reconnect(self, now: float) -> None:
-        """USB 재열거 후 다시 붙는다(포트 번호가 바뀌어도 자동 탐지). 성공하면 램프를 다시 태운다."""
+        """USB 재열거 후 다시 붙는다(포트 번호가 바뀌어도 자동 탐지).
+
+        ★ 램프를 다시 태우지 않는다. 이 글러브는 USB 가 물리적으로 자주 끊기는데
+        (커널 `urb stopped: -32` → `USB disconnect`), 끊길 때마다 2초 램프를 다시 태우면
+        손이 그때마다 2초씩 굼떠져 추종이 안 된다. 타겟은 last_target 에서 이어가므로
+        끊김 비용은 "재연결에 걸린 시간" 뿐이다.
+        """
         if RECONNECT_SEC <= 0 or now - self.t_reconnect < RECONNECT_SEC:
             return
         self.t_reconnect = now
         if not self._try_open():
             return
-        # 재연결 시 글러브 값이 튈 수 있으므로 현재 손자세부터 다시 램프
-        self.g_ema = None
-        self.start_pose = None
-        self.get_logger().info(f"글러브 재연결됨: {self.port} — 램프 재시작")
+        self.get_logger().info(f"글러브 재연결됨: {self.port} — 램프 없이 이어서 추종")
 
     def _reader_loop(self):
         """전용 스레드: 블로킹 readline 으로 계속 읽어 최신 프레임만 보관 (검증된 순수 리더와 동일 구조).
@@ -363,11 +369,9 @@ class GloveTeleop(Node):
                 self._diag_t0, self._pub_n = now, 0
                 self._pub_max, self._pub_gaps = 0.0, 0
         self.last_rx = now
-        self.g_ema = ([float(v) for v in got] if self.g_ema is None else
-                      [EMA_ALPHA * v + (1.0 - EMA_ALPHA) * p
-                       for v, p in zip(got, self.g_ema)])
+        self.g_last = [float(v) for v in got]   # 필터 없음 — 받은 그대로
         m = Float32MultiArray()
-        m.data = [float(v) for v in got]   # SHM에는 필터 전 raw를 기록
+        m.data = self.g_last
         self.pub_glove.publish(m)
 
         # (프레임을 방금 받았으므로 stale 검사는 불필요 — 수신이 끊기면 이 함수 자체가 호출되지 않아
@@ -375,10 +379,11 @@ class GloveTeleop(Node):
         if self.hand_q is None:                # 손 상태 미수신 → 램프 시작점 없음
             return
         if not self.engaged:                   # 발판 disengage → 타겟 홀드(제어 PC가 마지막값 유지)
-            self.start_pose = None             #   재engage 시 현재 손자세부터 다시 램프(튐 방지)
-            return
+            return                             #   ★ start_pose 를 지우지 않는다: 재engage 때 램프를
+                                               #   다시 태우면 그때마다 2초간 손이 굼떠진다.
+                                               #   타겟은 last_target 에서 그대로 이어진다.
 
-        if self.start_pose is None:
+        if self.start_pose is None and not self.ramp_done:
             # 첫 타겟 = 현재 손 자세 (서보 켜는 순간 튀지 않게)
             self.start_pose = list(self.hand_q)
             self.last_target = list(self.hand_q)
@@ -393,15 +398,18 @@ class GloveTeleop(Node):
             self.get_logger().info(f"현재 자세에서 {RAMP_SEC:.1f}초 램프 시작")
             return
 
-        mapped = self._map_to_hand(self.g_ema)
+        mapped = self._map_to_hand(self.g_last)
 
-        # 시작 자세 → 글러브 타겟 램프
-        a = 1.0 if RAMP_SEC <= 0 else min(1.0, (now - self.t_start) / RAMP_SEC)
-        blended = [(1.0 - a) * s + a * t for s, t in zip(self.start_pose, mapped)]
-
-        # 주기당 변화량 제한
-        target = [p + max(-MAX_STEP, min(MAX_STEP, b - p))
-                  for b, p in zip(blended, self.last_target)]
+        if not self.ramp_done:
+            # 시작 자세 → 글러브 타겟 램프 (기동 후 최초 1회만)
+            a = 1.0 if RAMP_SEC <= 0 else min(1.0, (now - self.t_start) / RAMP_SEC)
+            target = [(1.0 - a) * s + a * t for s, t in zip(self.start_pose, mapped)]
+            if a >= 1.0:
+                self.ramp_done = True
+                self.get_logger().info(
+                    "램프 완료 — 이후 글러브 raw 그대로 통과 (EMA·rate limit 없음)")
+        else:
+            target = mapped        # ★ raw 그대로 통과: 필터도 주기당 변화량 제한도 없음
 
         # dry-run에서도 타겟은 계산한다 (확인용) — 발행만 안 함
         self.last_target = target
@@ -417,11 +425,11 @@ class GloveTeleop(Node):
         if self.ser is None:
             self.get_logger().warn("글러브 끊김/미연결 — USB 꽂으면 자동 연결 (재시도 중)")
             return
-        if self.g_ema is None:
+        if self.g_last is None:
             self.get_logger().warn(f"글러브 수신 없음 — {self.port} 확인")
             return
         tag = "DRY" if self.dry_run else "RUN"
-        g = " ".join(f"{v:6.0f}" for v in self.g_ema[:8])
+        g = " ".join(f"{v:6.0f}" for v in self.g_last[:8])
         if self.hand_q is None:
             self.get_logger().warn(
                 f"[{tag}] glove[0:8] {g} | /hand/{self.side}/joint_states 대기 중 "
