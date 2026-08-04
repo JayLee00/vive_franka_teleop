@@ -11,11 +11,12 @@
 
   S(rising edge)  -> 새 Demo_N 버퍼 시작
   E(falling edge) -> 버퍼를 Demo_N 그룹으로 저장, demo_idx += 1
-  s 키            -> 현재 파일 저장하고 다음 에피소드부터 Demo_0 새 파일 (배치 분리용)
+  k 키            -> 현재 파일 저장하고 다음 에피소드부터 Demo_0 새 파일 (배치 분리용)
   Ctrl+C          -> 파일 닫고 종료 (저장된 데모는 유지)
 
 배치(nominal / 낙하회복 등)를 다른 파일로 나눠 담고 싶을 때 프로세스를 재시작하지 않고
-s 만 누르면 된다. 파일명은 생성 시각이므로 새 파일은 새 타임스탬프를 받는다.
+k 만 누르면 된다. 파일명은 생성 시각이므로 새 파일은 새 타임스탬프를 받는다.
+(S/E 는 발판의 에피소드 시작/종료라서 롤오버 키는 겹치지 않게 k 로 둔다.)
 
 실행 (env 먼저):
   source /opt/ros/humble/setup.bash && source ~/franka_ros2_ws/install/setup.bash
@@ -36,6 +37,7 @@ from pathlib import Path
 
 import numpy as np
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import JointState
@@ -117,7 +119,7 @@ class Recorder(Node):
         self.t_demo_start = 0.0
         self.f = None
         self.out_path = None                      # 파일은 첫 에피소드 시작 때 생성
-        self.roll_req = False                     # s 키 → 파일 롤오버 요청 (키 스레드가 세팅)
+        self.roll_req = False                     # k 키 → 파일 롤오버 요청 (키 스레드가 세팅)
         self.create_subscription(Bool, "/record/enable", self._on_enable, 10)
 
         self.create_timer(1.0 / RATE_HZ, self._tick)
@@ -128,7 +130,7 @@ class Recorder(Node):
         else:
             self.get_logger().info(
                 f"레코더 준비. 발판 중간(=/record/enable)으로 시작/종료.\n"
-                f"    s = 현재 파일 저장하고 다음 에피소드부터 Demo_0 새 파일\n"
+                f"    k = 현재 파일 저장하고 다음 에피소드부터 Demo_0 새 파일\n"
                 f"    저장 폴더: {OUT_DIR}")
 
     def _on_msg(self, fields, msg):
@@ -252,12 +254,12 @@ class Recorder(Node):
 
 
 def _key_loop(node: Recorder):
-    """엔터 없이 1글자씩 읽어 s 를 롤오버 요청으로 넘긴다 (터미널은 main 이 원복)."""
+    """엔터 없이 1글자씩 읽어 k 를 롤오버 요청으로 넘긴다 (터미널은 main 이 원복)."""
     while True:
         ch = sys.stdin.read(1)
         if not ch:
             return
-        if ch in ("s", "S"):
+        if ch in ("k", "K"):
             node.roll_req = True
 
 
@@ -269,17 +271,22 @@ def main():
     rclpy.init()
     node = Recorder(check=args.check)
 
-    # s 키 감지: cbreak 로 엔터 없이 1글자 읽기 (ISIG 는 유지되어 Ctrl+C 정상 동작).
+    # k 키 감지: cbreak 로 엔터 없이 1글자 읽기 (ISIG 는 유지되어 Ctrl+C 정상 동작).
     # 터미널 원복은 main 의 finally 에서 — 키 스레드는 daemon 이라 finally 가 안 돌 수 있다.
     old_tty = None
     if not args.check and sys.stdin.isatty():
         old_tty = termios.tcgetattr(sys.stdin.fileno())
         tty.setcbreak(sys.stdin.fileno())
         threading.Thread(target=_key_loop, args=(node,), daemon=True).start()
+    elif not args.check:
+        # nohup/백그라운드 등 tty 없이 띄우면 키를 읽을 수 없다 — 조용히 안 먹는 것보다 알려준다.
+        node.get_logger().warn("tty 아님 → k 키 롤오버 사용 불가 (터미널에서 직접 실행하세요)")
 
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
+        # Ctrl+C 시 rclpy 가 컨텍스트를 먼저 닫으면 KeyboardInterrupt 대신 후자가 올라온다.
+        # 둘 다 잡아야 저장 직후 traceback 이 안 뜬다(파일은 finally 에서 이미 마무리됨).
         pass
     finally:
         if old_tty is not None:
