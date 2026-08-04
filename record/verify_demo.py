@@ -27,7 +27,9 @@ import numpy as np
 
 FRUIT_SIZE_RANGE = (0.03, 0.12)   # 레몬 축 길이 상식 범위 [m]
 IDLE_EPS = 2.0                    # action 변화 이하면 '정지'로 간주 [count/step]
-EXPECT_CONST = ("10_franka", "11_franka", "12_franka")   # 팔 고정 데모라 상수가 정상
+FT_KEY = "20_paxini_ft"           # 촉각(접촉 반응) — 미끄러짐 감지의 근거
+# 상수/미수신이 정상인 채널: 팔 고정 데모라 franka 는 상수, mode/servo_on 도 상수
+CONST_OK = ("01_hand_mode", "02_hand_servo_on")
 
 
 def check_demo(name: str, g: h5py.Group, rate_hz: float) -> list[str]:
@@ -45,10 +47,12 @@ def check_demo(name: str, g: h5py.Group, rate_hz: float) -> list[str]:
     # 채널별 상태
     frozen, allzero = [], []
     for k in sorted(g.keys()):
+        if "franka" in k or k.startswith(CONST_OK):   # 팔 고정 데모 → 상수가 정상
+            continue
         a = np.asarray(g[k][()], dtype=np.float64).reshape(n, -1)
         if not np.any(a):
             allzero.append(k)
-        elif float(a.std(axis=0).max()) == 0.0 and not k.startswith(EXPECT_CONST):
+        elif float(a.std(axis=0).max()) == 0.0:
             frozen.append(k)
     if allzero:
         warn.append(f"전부 0(미수신): {allzero}")
@@ -68,11 +72,11 @@ def check_demo(name: str, g: h5py.Group, rate_hz: float) -> list[str]:
         warn.append(f"정지 구간 {idle*100:.0f}% — 시연 밀도 낮음")
 
     # 촉각 (접촉 반응)
-    if "06_hand_j_kin" in g:
-        ft = np.asarray(g["06_hand_j_kin"][()], dtype=np.float64).reshape(n, -1)
+    if FT_KEY in g:
+        ft = np.asarray(g[FT_KEY][()], dtype=np.float64).reshape(n, -1)
         print(f"   촉각 ft  |max| {np.abs(ft).max():.3f},  채널 std 최대 {ft.std(axis=0).max():.4f}")
         if np.abs(ft).max() < 1e-6:
-            warn.append("paxini ft 가 항상 0 — 촉각 없이 학습하는 셈")
+            warn.append(f"{FT_KEY} 가 항상 0 — 촉각 없이 학습하는 셈")
 
     # 과일
     if "30_fruit_pos" in g:
