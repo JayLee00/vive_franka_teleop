@@ -6,7 +6,8 @@
     - 좌표축 3개 (X=빨강, Y=초록, Z=파랑) → 오리엔테이션을 눈으로 확인
     - 중심점 + 텍스트 (위치[m], RPY[deg], 크기 a/b/c[m], 수신율)
 
-화면 하단에는 손가락 F/T 를 좌우 두 패널로 동시에 띄운다 (각각 영상의 1/5 크기):
+화면 하단에는 손가락 F/T 를 좌우 두 패널로 동시에 띄운다
+(각각 폭은 영상의 1/4, 높이는 1/5 — 가로로 넓은 띠. 좌우 합쳐 너비의 절반):
     좌측 하단  paxini ft  /paxini/<side>/ft   12ch = 손가락당 [Fz, Fx, Fy]
     우측 하단  hand ft    /hand/<side>/kin    12ch = 손가락당 [Ty, Tx, Fz]
     손가락 순서는 둘 다 엄지(T) → 검지(I) → 중지(M) → 약지(R).
@@ -134,13 +135,13 @@ class FTPanel:
     """
 
     def __init__(self, title: str, ch_names, vec_idx, col_idx,
-                 fixed_scale: float = 0.0, decay: float = 0.995):
+                 fixed_scale: float = 0.0, tau: float = 3.0):
         self.title = title
         self.ch = tuple(ch_names)          # 채널 3개 이름 (데이터 순서 그대로)
         self.vx, self.vy = vec_idx         # 화살표에 쓸 채널 인덱스 (x, y)
         self.ci = col_idx                  # 색에 쓸 채널 인덱스
         self.fixed = float(fixed_scale)
-        self.decay = decay
+        self.tau = float(tau)              # 스케일 감쇠 시간상수 [s]
         self.data = None                   # (4,3)
         self.last_rx = 0.0
         self.rate = 0.0
@@ -159,12 +160,16 @@ class FTPanel:
             if dt > 1e-6:
                 inst = 1.0 / dt
                 self.rate = inst if self.rate == 0 else 0.9 * self.rate + 0.1 * inst
+        # 자동 스케일: 순간 최대는 즉시 반영, 줄어들 때는 시간상수 tau 로 감쇠.
+        # 감쇠를 '샘플당'으로 걸면 토픽 주기에 따라 속도가 달라진다(paxini 90Hz vs
+        # hand kin 200Hz). 시간 기반이라야 두 패널이 같은 속도로 회복한다.
+        dt = max(0.0, t - self._prev_t) if self._prev_t is not None else 0.0
         self._prev_t = t
-        # 자동 스케일: 순간 최대는 즉시 반영, 줄어들 때만 천천히 감쇠
+        k = math.exp(-dt / self.tau) if dt > 0 else 1.0
         vmag = float(np.max(np.hypot(self.data[:, self.vx], self.data[:, self.vy])))
         cmag = float(np.max(np.abs(self.data[:, self.ci])))
-        self._vmax = max(vmag, self._vmax * self.decay)
-        self._cmax = max(cmag, self._cmax * self.decay)
+        self._vmax = max(vmag, self._vmax * k)
+        self._cmax = max(cmag, self._cmax * k)
 
     def scales(self):
         if self.fixed > 0:
@@ -186,23 +191,27 @@ class FTPanel:
         allzero = self.data is not None and not np.any(self.data)
         vmax, cmax = self.scales()
 
-        fs = max(0.28, min(0.42, pw / 320.0))          # 패널 크기에 맞춘 글자 크기
-        th = max(9, int(14 * fs / 0.35))
+        # 레이아웃은 높이 기준으로 결정론적으로 잡는다. 행 4개(제목·손가락기호·수치·범례)가
+        # 항상 들어가고 남은 높이를 원에 준다 → 폭만 늘려도 아무것도 잘리지 않는다.
+        th = max(9, int(ph * 0.145))
+        fs = max(0.26, min(0.44, th / 40.0))
+        cw = pw // 4
+        circle_h = ph - 4 * th
+        show_num = circle_h >= 14
+        if not show_num:                       # 아주 낮은 패널: 수치 행 포기
+            circle_h = ph - 3 * th
+        r = max(5, min(cw // 2 - 3, circle_h // 2))
+        cy = y0 + th + r + 1
+        tag_y = y0 + ph - (2 * th if show_num else th) - 3
+        num_y = y0 + ph - th - 3
+        body_y = y0 + th
+
         cv2.putText(out, self.title, (x0 + 3, y0 + th - 2), cv2.FONT_HERSHEY_SIMPLEX,
                     fs, (255, 255, 255) if fresh else (150, 150, 160), 1, cv2.LINE_AA)
-
-        body_y = y0 + th
-        body_h = ph - th - 2
-        cw = pw // 4
-        r = max(5, min(cw // 2 - 2, int(body_h * 0.34)))
-        cy = body_y + r + 1
-
-        show_num = body_h >= 2 * r + 2 * th + 4
-        tag_y = cy + r + th - 3
         for i in range(4):
             cx = x0 + cw * i + cw // 2
             if i:                                   # 셀 구분선
-                cv2.line(out, (x0 + cw * i, body_y), (x0 + cw * i, y0 + ph - th - 2),
+                cv2.line(out, (x0 + cw * i, body_y), (x0 + cw * i, y0 + ph - th),
                          (70, 70, 70), 1)
             if self.data is None:
                 cv2.circle(out, (cx, cy), r, (60, 60, 60), 1, cv2.LINE_AA)
@@ -220,7 +229,7 @@ class FTPanel:
             # 채워진 원 위에서도 보이게 검은 테두리를 먼저 굵게 깔고 흰 선을 덮는다.
             mag = math.hypot(vx, vy)
             if fresh and mag > 1e-9:
-                s = min(1.0, mag / vmax) * (r + max(4, r // 2))
+                s = min(1.0, mag / vmax) * (r * 0.95)   # 원 안에 머물게 → 겹침 없음
                 ex = int(round(cx + vx / mag * s))
                 ey = int(round(cy - vy / mag * s))
                 cv2.arrowedLine(out, (cx, cy), (ex, ey), (0, 0, 0), 3,
@@ -232,7 +241,7 @@ class FTPanel:
             _put_center(out, FINGER_TAGS[i], cx, tag_y, fs,
                         (255, 255, 255) if fresh else (140, 140, 140))
             if show_num:
-                _put_center(out, _compact(fz), cx, tag_y + th, fs * 0.9,
+                _put_center(out, _compact(fz), cx, num_y, fs * 0.95,
                             (235, 235, 235) if fresh else (130, 130, 130))
 
         # 상태 / 범례 (패널이 좁아도 잘리지 않게 짧게)
@@ -253,9 +262,9 @@ class FTPanel:
 class Overlay:
     """영상 위에 6DoF 를 그리는 순수 렌더러 (ROS 무관 → selftest 가능)."""
 
-    def __init__(self, panel_scale: float = 0.2,
+    def __init__(self, panel_w_scale: float = 0.25, panel_h_scale: float = 0.20,
                  ft_scale: float = 0.0, hand_ft_scale: float = 0.0,
-                 show_ft: bool = True):
+                 ft_tau: float = 3.0, show_ft: bool = True):
         self.K = None
         self.pos = None        # (3,)
         self.R = None          # (3,3)
@@ -265,14 +274,17 @@ class Overlay:
         self.rate = 0.0
         self._prev_t = None
 
-        self.panel_scale = panel_scale
+        # 좌우로 넓게: 폭은 영상의 1/4, 높이는 1/5 → 가로로 늘어난 띠 모양.
+        # 두 패널이 각각 1/4 이라 좌우 합쳐 화면 너비의 절반을 쓴다.
+        self.panel_w_scale = panel_w_scale
+        self.panel_h_scale = panel_h_scale
         self.show_ft = show_ft
         # paxini: 손가락당 [Fz, Fx, Fy] → 화살표 = (Fx, Fy) 전단력, 색 = Fz 법선력
-        self.paxini = FTPanel("paxini ft  T/I/M/R", ("Fz", "Fx", "Fy"),
-                              vec_idx=(1, 2), col_idx=0, fixed_scale=ft_scale)
+        self.paxini = FTPanel("paxini ft  [Fz,Fx,Fy]", ("Fz", "Fx", "Fy"),
+                              vec_idx=(1, 2), col_idx=0, fixed_scale=ft_scale, tau=ft_tau)
         # hand kin(=hand_ft): 손가락당 [Ty, Tx, Fz] → 화살표 = (Tx, Ty) 모멘트, 색 = Fz
-        self.hand_ft = FTPanel("hand ft  T/I/M/R", ("Ty", "Tx", "Fz"),
-                               vec_idx=(1, 0), col_idx=2, fixed_scale=hand_ft_scale)
+        self.hand_ft = FTPanel("hand ft  [Ty,Tx,Fz]", ("Ty", "Tx", "Fz"),
+                               vec_idx=(1, 0), col_idx=2, fixed_scale=hand_ft_scale, tau=ft_tau)
 
     def set_pose(self, p, q, frame_id, t):
         self.pos = np.asarray(p, dtype=np.float64)
@@ -344,8 +356,8 @@ class Overlay:
 
         # 손가락 F/T 패널: 좌측 하단 = paxini, 우측 하단 = hand ft (영상의 panel_scale 배)
         if self.show_ft:
-            pw = max(96, int(w * self.panel_scale))
-            ph = max(64, int(h * self.panel_scale))
+            pw = max(120, int(w * self.panel_w_scale))
+            ph = max(64, int(h * self.panel_h_scale))
             self.paxini.draw_into(out, 0, h - ph, pw, ph)
             self.hand_ft.draw_into(out, w - pw, h - ph, pw, ph)
         return out
@@ -390,8 +402,9 @@ def run_ros(args):
                      history=HistoryPolicy.KEEP_LAST, depth=1)
     rclpy.init()
     node = Node("fruit_overlay")
-    ov = Overlay(panel_scale=args.panel_scale, ft_scale=args.ft_scale,
-                 hand_ft_scale=args.hand_ft_scale, show_ft=not args.no_ft)
+    ov = Overlay(panel_w_scale=args.panel_w_scale, panel_h_scale=args.panel_h_scale,
+                 ft_scale=args.ft_scale, hand_ft_scale=args.hand_ft_scale,
+                 ft_tau=args.ft_tau, show_ft=not args.no_ft)
     latest = {"img": None, "new": False}
 
     t0 = time.perf_counter()          # 디스커버리 대기
@@ -492,12 +505,12 @@ def run_ros(args):
             rclpy.shutdown()
 
 
-def selftest(panel_scale: float = 0.2):
+def selftest(pw_scale: float = 0.25, ph_scale: float = 0.20):
     """ROS 없이 가짜 pose + 가짜 F/T 로 투영·렌더 검증."""
     img = np.full((480, 640, 3), 40, np.uint8)
     cv2.putText(img, "SELFTEST (fake pose)", (170, 460), cv2.FONT_HERSHEY_SIMPLEX,
                 0.6, (80, 80, 80), 1)
-    ov = Overlay(panel_scale=panel_scale)
+    ov = Overlay(panel_w_scale=pw_scale, panel_h_scale=ph_scale)
     ov.K = np.array([[615.0, 0, 320.0], [0, 615.0, 240.0], [0, 0, 1.0]])
     ang = math.radians(30)
     q = (0.0, math.sin(ang / 2), 0.0, math.cos(ang / 2))     # y축 30deg
@@ -530,15 +543,20 @@ def main():
     ap.add_argument("--save-after", type=float, default=0.0,
                     help="N초 뒤 스냅샷 자동 저장 후 종료 (0=끔)")
     ap.add_argument("--side", default="right", help="paxini/hand 쪽 (right|left)")
-    ap.add_argument("--panel-scale", type=float, default=0.2,
-                    help="F/T 패널 크기 = 영상의 이 배수 (기본 0.2 = 1/5)")
+    ap.add_argument("--panel-w-scale", type=float, default=0.25,
+                    help="F/T 패널 폭 = 영상 너비의 이 배수 (기본 0.25 = 1/4)")
+    ap.add_argument("--panel-h-scale", type=float, default=0.20,
+                    help="F/T 패널 높이 = 영상 높이의 이 배수 (기본 0.20 = 1/5)")
     ap.add_argument("--ft-scale", type=float, default=0.0,
                     help="paxini 화살표/색 스케일 고정 (0=자동)")
     ap.add_argument("--hand-ft-scale", type=float, default=0.0,
                     help="hand ft 화살표/색 스케일 고정 (0=자동)")
+    ap.add_argument("--ft-tau", type=float, default=3.0,
+                    help="자동 스케일 감쇠 시간상수[s] — 작으면 민감, 크면 안정 (기본 3)")
     ap.add_argument("--no-ft", action="store_true", help="F/T 패널 끄기")
     args = ap.parse_args()
-    selftest(args.panel_scale) if args.selftest else run_ros(args)
+    (selftest(args.panel_w_scale, args.panel_h_scale)
+     if args.selftest else run_ros(args))
 
 
 if __name__ == "__main__":
