@@ -51,7 +51,8 @@ import numpy as np
 import torch
 
 import rclpy
-from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.callback_groups import (MutuallyExclusiveCallbackGroup,
+                                   ReentrantCallbackGroup)
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -103,6 +104,16 @@ class Runner(Node):
         self.n_clamp_j = 0
         self.n_clamp_v = 0
         self.n_stale = 0
+        self.n_overrun = 0                 # 추론이 제어 주기를 넘긴 횟수
+        self.n_starve = 0                  # 발행 시점에 새 정책 타겟이 없던 횟수
+        self.n_fruit_stale = 0             # 과일 인식이 낡아 홀드한 횟수(정지 아님)
+        self.fruit_ok = True
+        self.next_target = None            # 정책 스레드 → 발행 스레드
+        self.have_new = False
+        self.interp_from = None
+        self._plock = threading.Lock()     # 정책 타겟/보간 상태 보호
+        self._stop = False
+        self._policy_thread = None
 
         cb = ReentrantCallbackGroup()
         self.create_subscription(JointState, f"/hand/{side}/joint_states",
@@ -125,13 +136,17 @@ class Runner(Node):
         self.pub_servo = self.create_publisher(Bool, f"/hand/{side}/cmd_servo", 1)
         self.servo_sent = False
 
-        self.create_timer(1.0 / args.publish_hz, self._tick, callback_group=cb)
+        # 발행 타이머는 절대 겹치지 않게 (겹치면 콜백이 쌓여 지연이 눈덩이처럼 커진다)
+        pub_cb = MutuallyExclusiveCallbackGroup()
+        self.create_timer(1.0 / args.publish_hz, self._tick, callback_group=pub_cb)
         self.create_timer(2.0, self._conflict_check, callback_group=cb)
 
         self.jl = np.array(cfg["joint_limits"], dtype=np.float32)   # (16,2)
         self.max_delta_pub = args.max_rate_cps / args.publish_hz
 
         self._banner()
+        self._policy_thread = threading.Thread(target=self._policy_loop, daemon=True)
+        self._policy_thread.start()
 
     # ── 로그 ──────────────────────────────────────────────────────────────
     def _banner(self):
@@ -147,7 +162,8 @@ class Runner(Node):
         L(f"  DDIM steps    : {a.ddim_steps}")
         L(f"  속도 한계     : {a.max_rate_cps:.0f} count/s "
           f"(발행 틱당 {self.max_delta_pub:.0f})")
-        L(f"  램프          : {a.ramp_sec:.1f}s     워치독 : {a.stale_sec:.2f}s")
+        L(f"  램프          : {a.ramp_sec:.1f}s     워치독 : 손 {a.stale_sec:.2f}s / "
+          f"과일 {a.fruit_stale_sec:.2f}s(홀드만)")
         L(f"  인게이지      : {a.enable_topic} "
           f"{'(필요)' if a.require_enable else '(무시 — 즉시 동작)'}")
         L(f"  발행          : {'DRY-RUN (발행 안 함)' if a.dry_run else f'/hand/{a.side}/q_target'}")
@@ -243,8 +259,33 @@ class Runner(Node):
             self.n_clamp_j += int(out.sum())
         return np.clip(t, self.jl[:, 0], self.jl[:, 1]).astype(np.float32)
 
-    # ── 메인 틱 ───────────────────────────────────────────────────────────
-    def _tick(self):
+    # ── 정책 스레드: obs 샘플 + 추론 (발행 경로와 분리) ────────────────────
+    #
+    # 왜 스레드로 빼는가: 추론을 발행 타이머 콜백 안에서 하면, 추론이 발행 주기보다
+    # 길어질 때 콜백이 밀려 쌓이고 (Reentrant 그룹이면 동시 실행까지 겹쳐) 지연이
+    # 눈덩이처럼 커진다. 실기에서 11ms 추론이 272ms 로 불어났다. 발행은 절대 추론을
+    # 기다리면 안 된다.
+    #
+    # 왜 control_hz 로 도는가: obs 히스토리 간격이 학습과 같아야 한다. 학습은 100Hz
+    # 원본에서 stride 5 로 뽑아 T_obs 샘플 간격이 50ms 다. 발행 주기(100Hz)로 obs 를
+    # 쌓으면 간격이 10ms 가 되어 시간축이 어긋난다.
+    def _policy_loop(self):
+        period = 1.0 / self.args.control_hz
+        nxt = time.perf_counter()
+        while not self._stop:
+            nxt += period
+            try:
+                self._policy_step()
+            except Exception as e:
+                self.get_logger().error(f"정책 루프 오류: {e}")
+            slack = nxt - time.perf_counter()
+            if slack > 0:
+                time.sleep(slack)
+            else:
+                self.n_overrun += 1
+                nxt = time.perf_counter()      # 밀렸으면 기준 리셋(누적 지연 방지)
+
+    def _policy_step(self):
         now = time.time()
         with self.lock:
             j_pos = self.j_pos.copy(); kin = self.kin.copy(); ft = self.ft.copy()
@@ -252,53 +293,75 @@ class Runner(Node):
             t_hand, t_fruit = self.t_hand, self.t_fruit
 
         if t_hand == 0.0:
+            return
+        # 손 상태가 낡으면 정지(안전). 과일은 낡아도 직전 값을 홀드하고 계속 간다 —
+        # 학습 데이터도 과일이 8~19Hz 로 들어와 100Hz 기록 사이를 홀드한 것이므로
+        # 홀드가 오히려 학습 분포와 같다. 여기서 멈추면 8Hz 인식만으로 정책이 죽는다.
+        if now - t_hand > self.args.stale_sec:
+            self.n_stale += 1
+            return                          # 새 타겟 안 만듦 → 발행은 마지막 값 유지
+        if t_fruit > 0 and now - t_fruit > self.args.fruit_stale_sec:
+            self.n_fruit_stale += 1
+
+        obs, fruit_ok = self._make_obs(j_pos, kin, ft, fpos, fsize)
+        self.fruit_ok = fruit_ok
+        self.obs_buf.append(obs)            # 학습과 같은 control_hz 간격
+
+        if self.args.temporal_ensemble:
+            seq = self._infer()
+            for k in range(self.args.pred_horizon):
+                w = float(np.exp(-self.args.te_k * k))
+                i = self.policy_tick + k
+                s, ws = self.te_acc.get(i, (np.zeros(16), 0.0))
+                self.te_acc[i] = (s + w * seq[k], ws + w)
+            s, ws = self.te_acc.pop(self.policy_tick, (None, 0.0))
+            nxt = (s / ws) if ws > 0 else seq[0]
+            for i in list(self.te_acc):
+                if i < self.policy_tick:
+                    self.te_acc.pop(i, None)
+        else:
+            if not self.act_buf:
+                seq = self._infer()
+                for a in seq[:self.args.exec_horizon]:
+                    self.act_buf.append(a.copy())
+            nxt = self.act_buf.popleft()
+
+        self.policy_tick += 1
+        with self._plock:
+            self.next_target = np.asarray(nxt, np.float32)
+            self.have_new = True
+
+    # ── 발행 틱: 보간 + 가드 + 발행만. 추론은 하지 않는다 ─────────────────
+    def _tick(self):
+        now = time.time()
+        with self.lock:
+            j_pos = self.j_pos.copy()
+            t_hand = self.t_hand
+        if t_hand == 0.0:
             self.get_logger().warn(
                 f"/hand/{self.args.side}/joint_states 미수신 — 제어 PC 확인",
                 throttle_duration_sec=3.0)
             return
-        stale = (now - t_hand > self.args.stale_sec) or \
-                (t_fruit > 0 and now - t_fruit > self.args.stale_sec)
-        if stale:
-            self.n_stale += 1
-            return                          # 마지막 타겟 유지 (제어 PC 가 홀드)
-
-        obs, fruit_ok = self._make_obs(j_pos, kin, ft, fpos, fsize)
-        self.obs_buf.append(obs)
         if self.prev_target is None:
             self.prev_target = j_pos.copy()      # 램프 시작점 = 현재 자세
+            self.interp_from = j_pos.copy()
 
-        # ── 정책 틱 (publish_hz 를 n_interp 로 나눠서) ──
-        if self.interp_i >= self.n_interp or self.cur_target is None:
-            if self.args.temporal_ensemble:
-                seq = self._infer()
-                for k in range(self.args.pred_horizon):
-                    w = float(np.exp(-self.args.te_k * k))
-                    i = self.policy_tick + k
-                    s, ws = self.te_acc.get(i, (np.zeros(16), 0.0))
-                    self.te_acc[i] = (s + w * seq[k], ws + w)
-                s, ws = self.te_acc.pop(self.policy_tick, (None, 0.0))
-                nxt = (s / ws) if ws > 0 else seq[0]
-                for i in list(self.te_acc):
-                    if i < self.policy_tick:
-                        self.te_acc.pop(i, None)
-            else:
-                if not self.act_buf:
-                    seq = self._infer()
-                    for a in seq[:self.args.exec_horizon]:
-                        self.act_buf.append(a.copy())
-                nxt = self.act_buf.popleft()
-            self.cur_target = np.asarray(nxt, np.float32)
-            self.interp_i = 0
-            self.policy_tick += 1
+        with self._plock:
+            if self.have_new:
+                self.cur_target = self.next_target.copy()
+                self.have_new = False
+                self.interp_from = self.prev_target.copy()
+                self.interp_i = 0
+        if self.cur_target is None:
+            self.n_starve += 1
+            return
 
-        # ── 정책 타겟까지 선형 보간 + 시작 램프 ──
         self.interp_i += 1
-        frac = self.interp_i / self.n_interp
-        target = self.prev_target + (self.cur_target - self.prev_target) * frac
+        frac = min(1.0, self.interp_i / self.n_interp)
+        target = self.interp_from + (self.cur_target - self.interp_from) * frac
         el = now - self.t_start
-        if el < self.args.ramp_sec:
-            a = el / self.args.ramp_sec
-            target = j_pos + (target - j_pos) * a
+        if el < self.args.ramp_sec:                  # 시작 램프 (튐 방지)
+            target = j_pos + (target - j_pos) * (el / self.args.ramp_sec)
 
         target = self._guard(target, self.prev_target)
 
@@ -311,26 +374,31 @@ class Runner(Node):
             m = Float32MultiArray(); m.data = [float(v) for v in target]
             self.pub_target.publish(m)
             self.pub_cnt += 1
-        if self.interp_i >= self.n_interp:
-            self.prev_target = target.copy()
+        self.prev_target = target.copy()   # 속도 가드는 '실제로 보낸 값' 기준
 
+        infer = float(np.mean(self.infer_ms)) if self.infer_ms else 0.0
         d = Float64MultiArray()
-        d.data = [float(self.enabled), float(fruit_ok),
-                  float(np.mean(self.infer_ms) if self.infer_ms else 0.0),
+        d.data = [float(self.enabled), float(self.fruit_ok), infer,
                   float(len(self.act_buf)), float(np.abs(target - j_pos).max()),
-                  float(self.n_clamp_j), float(self.n_clamp_v), float(self.n_stale)]
+                  float(self.n_clamp_j), float(self.n_clamp_v), float(self.n_stale),
+                  float(self.n_overrun), float(self.n_starve)]
         self.pub_debug.publish(d)
 
         self.tick_cnt = getattr(self, "tick_cnt", 0) + 1
         if self.tick_cnt % int(self.args.publish_hz) == 0:
             self.get_logger().info(
-                f"[{el:6.1f}s] en={int(self.enabled)} fruit={'ok' if fruit_ok else 'HOLD'} "
-                f"infer={np.mean(self.infer_ms):5.1f}ms buf={len(self.act_buf)} "
+                f"[{el:6.1f}s] en={int(self.enabled)} "
+                f"fruit={'ok' if self.fruit_ok else 'HOLD'} "
+                f"infer={infer:5.1f}ms buf={len(self.act_buf)} "
                 f"|Δ|max={np.abs(target-j_pos).max():6.1f} "
-                f"clamp(j/v)={self.n_clamp_j}/{self.n_clamp_v} stale={self.n_stale} "
-                f"tgt[0:4]={np.round(target[:4],0)}")
+                f"clamp(j/v)={self.n_clamp_j}/{self.n_clamp_v} "
+                f"stale={self.n_stale}/{self.n_fruit_stale} overrun={self.n_overrun} "
+                f"starve={self.n_starve} tgt[0:4]={np.round(target[:4],0)}")
 
     def shutdown(self):
+        self._stop = True
+        if self._policy_thread is not None:
+            self._policy_thread.join(timeout=1.0)
         if self.args.hold_on_exit or self.args.dry_run:
             return
         self.get_logger().info("종료 — 마지막 타겟 유지 (서보는 끄지 않음)")
@@ -356,7 +424,10 @@ def main():
     ap.add_argument("--max_rate_cps", type=float, default=None,
                     help="관절 속도 상한 [count/s]. 기본: 체크포인트(학습 실측)")
     ap.add_argument("--ramp_sec", type=float, default=2.0)
-    ap.add_argument("--stale_sec", type=float, default=0.3)
+    ap.add_argument("--stale_sec", type=float, default=0.3,
+                    help="손 상태가 이보다 낡으면 새 타겟 생성 중단(안전)")
+    ap.add_argument("--fruit_stale_sec", type=float, default=1.0,
+                    help="과일 인식이 이보다 낡으면 카운트만(직전 값 홀드, 정지 아님)")
     ap.add_argument("--enable_topic", default="/dp/enable")
     ap.add_argument("--require_enable", type=int, default=1)
     ap.add_argument("--servo_on", type=int, default=1)
@@ -368,6 +439,8 @@ def main():
     if not os.path.exists(args.ckpt):
         print(f"[ERROR] 체크포인트 없음: {args.ckpt}")
         return 1
+    torch.set_num_threads(1)          # ROS 콜백과의 GIL 경쟁 줄이기
+    torch.set_grad_enabled(False)
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
     ck = torch.load(args.ckpt, map_location=device, weights_only=False)
     cfg = ck["config"]
@@ -397,7 +470,7 @@ def main():
 
     rclpy.init(args=ros_args or None)
     node = Runner(policy, sched, obs_norm, act_norm, cfg, args)
-    ex = MultiThreadedExecutor(num_threads=4)
+    ex = MultiThreadedExecutor(num_threads=2)
     ex.add_node(node)
     try:
         ex.spin()
