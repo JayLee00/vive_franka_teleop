@@ -137,10 +137,12 @@ Prasad et al., *Consistency Policy*, RSS 2024. DDIM 10스텝이 이미 실시간
 
 ## 3. 권고 순서
 
-0. **모델보다 먼저 `exec_horizon` 을 줄여라.** 실측으로 E=8→1 이 MAE 를 257→129 로
-   절반으로 줄인다(R² 0.767→0.950). 표의 어떤 아키텍처 변경보다 5배 큰 효과이고,
-   비용은 GPU 추론 11ms/틱뿐이다. 손이 떨리면 `--temporal_ensemble`(지터 ×1.02).
-1. **지금**: DP(U-Net) `runs/dp_lemon_final/best.pt` + `--exec_horizon 1` 로 실기 테스트.
+0. **`exec_horizon` 은 open-loop 지표를 믿지 말고 실기로 정해라.** open-loop 로는
+   E=8→1 이 MAE 를 257→129 로 절반으로 줄이지만(R² 0.767→0.950), **실기 closed-loop
+   에서는 정반대**였다: E=2 는 게이트가 아예 안 나오고(관절 std 39.6) E=16 이 나온다
+   (std 498, 주기 1.57s). open-loop 지표는 obs 를 GT 에서 읽으므로 "움직임에 헌신하지
+   않는 것"에 벌점을 주지 않는다. 자세한 기제는 `RESULTS.md` 5절.
+1. **지금**: DP(U-Net) `runs/dp_lemon_final/best.pt` + `--exec_horizon 16` 로 실기 테스트.
    실기에서 볼 것은 MAE 가 아니라 "게이팅이 주기적으로 나오는가 / 레몬이 흐를 때
    파지를 조이는가" 두 가지.
 2. **데이터가 늘기 전에 모델을 바꾸지 말 것.** 22 데모에서 아키텍처 순위는 시드에

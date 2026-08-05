@@ -73,22 +73,25 @@ python3 eval_rollout.py --ckpt runs/dp_lemon/best.pt --temporal_ensemble  # TE �
 ## 배포
 
 ```bash
+# 터미널마다 이 3줄 먼저
 source /opt/ros/humble/setup.bash && source ~/franka_ros2_ws/install/setup.bash
 export ROS_DOMAIN_ID=9 RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_LOCALHOST_ONLY=0
+export FASTRTPS_DEFAULT_PROFILES_FILE=~/Desktop/vive_franka_teleop/config/fastdds_lan_only.xml
 
-# 0) 글러브 텔레옵을 반드시 먼저 종료 (q_target 입구는 하나)
-pkill -f glove_teleop.py
+pkill -f glove_teleop.py     # q_target 입구는 하나 — 반드시 먼저
 
-# 1) 발행 없이 관측·추론·지연만 확인
-python3 run.py --ckpt runs/dp_lemon/best.pt --dry_run
-
-# 2) 인게이지 후 실행
-ros2 topic pub -1 /dp/enable std_msgs/Bool "{data: true}"
-python3 run.py --ckpt runs/dp_lemon/best.pt
-
-# 정지
-ros2 topic pub -1 /dp/enable std_msgs/Bool "{data: false}"
+# 실기 검증된 설정 (RESULTS.md 5절 참조)
+python3 run.py --ckpt runs/dp_lemon_final/best.pt \
+    --exec_horizon 16 --ddim_steps 10 --require_enable 0
 ```
+
+`--require_enable 0` 은 램프 2초 후 바로 발행하고 `Ctrl+C` 로 정지한다.
+발판으로 켜고 끄려면 `foot_pedal_glove.py` 를 띄우고
+`--enable_topic /teleop/hand_engage/right` (오른쪽=ON, 왼쪽=OFF).
+
+> **`exec_horizon` 을 줄이지 말 것.** open-loop 지표는 작은 값을 권하지만 실기에서는
+> 반대로 게이트가 사라진다. `RESULTS.md` 5절에 측정과 기제.
+> **`en=0` 이면 인게이지가 안 된 것** — 계산만 하고 발행하지 않는다.
 
 ### 조절 노브
 

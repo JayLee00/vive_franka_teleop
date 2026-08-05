@@ -55,7 +55,8 @@ from rclpy.callback_groups import (MutuallyExclusiveCallbackGroup,
                                    ReentrantCallbackGroup)
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
+                       ReliabilityPolicy)
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, Float32MultiArray, Float64MultiArray, Int32
@@ -65,6 +66,10 @@ from dp_data import Normalizer
 from dp_model import DDPMScheduler, policy_from_ckpt
 
 SENSOR_QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                        history=HistoryPolicy.KEEP_LAST, depth=1)
+# 인게이지: 늦게 붙어도 마지막 값을 받도록 latch. foot_pedal_glove.py 가 쓰는 QoS 와 동일.
+ENGAGE_QOS = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                        durability=DurabilityPolicy.TRANSIENT_LOCAL,
                         history=HistoryPolicy.KEEP_LAST, depth=1)
 
 
@@ -127,7 +132,7 @@ class Runner(Node):
         self.create_subscription(Float32MultiArray, "/fruit/size",
                                  self._cb_fsize, SENSOR_QOS, callback_group=cb)
         self.create_subscription(Bool, args.enable_topic,
-                                 self._cb_enable, 10, callback_group=cb)
+                                 self._cb_enable, ENGAGE_QOS, callback_group=cb)
 
         self.pub_target = self.create_publisher(Float32MultiArray,
                                                 f"/hand/{side}/q_target", SENSOR_QOS)
@@ -428,7 +433,8 @@ def main():
                     help="손 상태가 이보다 낡으면 새 타겟 생성 중단(안전)")
     ap.add_argument("--fruit_stale_sec", type=float, default=1.0,
                     help="과일 인식이 이보다 낡으면 카운트만(직전 값 홀드, 정지 아님)")
-    ap.add_argument("--enable_topic", default="/dp/enable")
+    ap.add_argument("--enable_topic", default="/dp/enable",
+                    help="발판으로 켜려면 /teleop/hand_engage/right (오른쪽=ON, 왼쪽=OFF)")
     ap.add_argument("--require_enable", type=int, default=1)
     ap.add_argument("--servo_on", type=int, default=1)
     ap.add_argument("--hold_on_exit", action="store_true", default=True)

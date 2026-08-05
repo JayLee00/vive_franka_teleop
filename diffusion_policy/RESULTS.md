@@ -92,7 +92,11 @@ NaN/Inf 는 3,393,942 원소 중 **0개**.
 | 설정 | MAE [count] | MAE [deg] | RMSE | R² | 기준선 대비 |
 |---|---:|---:|---:|---:|---:|
 | `exec_horizon=8` (참조 기본값) | 257.3 | 5.66 | 383 | 0.767 | −59.6% |
-| **`exec_horizon=1` (권장)** | **128.7** | **2.83** | 176 | **0.950** | **−79.8%** |
+| `exec_horizon=1` | **128.7** | **2.83** | 176 | **0.950** | **−79.8%** |
+
+> ⚠️ **이 지표만 보고 배포 설정을 고르면 안 된다.** open-loop 지표는 obs 를 항상 GT
+> 궤적에서 읽으므로 짧은 exec_horizon 을 체계적으로 편애하는데, 실기 closed-loop 에서는
+> **정반대**였다. 5절 마지막을 반드시 볼 것.
 
 데모별(E=1): Demo_0 145.5c / Demo_2 114.8c / Demo_8 99.7c.
 기준선 = 항상 데모 평균 액션 출력 (637 count).
@@ -131,8 +135,7 @@ ep200 에서 341.3 → ep530 에서 341.2 → ep1000 까지 343~344 로 정체.
 (`eval/error_vs_horizon_raw.png`). **E 를 8→1 로 바꾸면 오차가 절반이 된다.**
 학습을 더 해서는 못 얻는 개선이다.
 
-- **정확도 우선 → `--exec_horizon 1`**
-- **매끄러움 우선 → `--temporal_ensemble`** (지터가 GT 수준 ×1.02. 손이 떨리면 이걸로)
+…라고 open-loop 지표는 말하지만, **실기에서는 반대였다.** 바로 아래 참조.
 
 ### 지연 — GPU 필수
 
@@ -146,23 +149,62 @@ ep200 에서 341.3 → ep530 에서 341.2 → ep1000 까지 343~344 로 정체.
 E=1 / TE 는 20Hz 마다 추론하므로 **GPU 로 돌려야 한다**(`--cpu` 금지).
 E=4 이상이면 CPU 도 여유가 있다(예산 200ms+).
 
-### 권장 실행
+### ★ 실기 closed-loop 결과 — open-loop 지표와 정반대다
+
+2026-08-05 실기 측정 (레몬 없이 손만, 20초 인게이지, joint_states 200Hz 기록):
+
+| | `exec_horizon=2` | **`exec_horizon=16`** | 학습 데모 |
+|---|---:|---:|---:|
+| 16관절 std | 39.6 count | **498.2** | 760 |
+| 관절 range 평균 | ~280 (6°) | **2041 (44.9°)** | — |
+| 게이트 주기 | 없음 (자기상관 r=0.12~0.24) | **1.53~1.62s, r=0.26~0.59** | **1.79s** |
+
+7개 관절 전부가 1.57s 근처의 **동일한 주기**로 움직였다. 노이즈라면 관절마다 주기가
+달라진다. `exec_horizon=2` 에서는 게이트가 아예 나오지 않았다.
+
+**기제** (`fixedpoint.py` 오프라인 실험):
+
+| obs | 지평 내 계획 변화 | 평균 액션과의 거리 | 샘플 간 std |
+|---|---:|---:|---:|
+| 학습분포 평균 obs = **사이클 중심** | 596.8 | **99.8** | 27.9 |
+| 실제 데모 프레임 5개 | 863~1647 | **582~800** | 22~45 |
+
+사이클 중심에서 정책은 평균 액션에서 99.8 count 밖에 안 떨어진 값을 낸다(데모 지점에서는
+582~800). 샘플 간 std 가 22~45 로 작으니 다봉성 때문에 망설이는 게 아니라 **확신을 갖고
+평균을 내놓는다.** 그런데 중심에서도 지평 안에 596 count 의 움직임을 *계획*한다 —
+exec_horizon 이 작으면 그 계획이 발현되기 전에 잘리고 다시 중심에서 재계획하므로
+**영원히 중심을 벗어나지 못한다(자기강화 고정점).** 청크를 끝까지 실행하면 사이클 위로
+올라타고, 그때부터 손 자세 자체가 위상을 알려준다.
+
+과일 각도가 관측에 없어 위상이 부분관측이라는 이 프로젝트의 구조적 한계가, 배포 단계에서
+이 형태로 드러난 것이다.
+
+### 권장 실행 (실기 검증된 설정)
 
 ```bash
 source /opt/ros/humble/setup.bash && source ~/franka_ros2_ws/install/setup.bash
 export ROS_DOMAIN_ID=9 RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_LOCALHOST_ONLY=0
+export FASTRTPS_DEFAULT_PROFILES_FILE=~/Desktop/vive_franka_teleop/config/fastdds_lan_only.xml
 
 pkill -f glove_teleop.py                    # q_target 입구는 하나 — 반드시 먼저
 
 cd diffusion_policy
-python3 run.py --ckpt runs/dp_lemon_final/best.pt --exec_horizon 1 --dry_run
-#   위에서 infer=~11ms, fruit=ok, |Δ|max 가 상식적인지 확인한 뒤
-ros2 topic pub -1 /dp/enable std_msgs/Bool "{data: true}"
-python3 run.py --ckpt runs/dp_lemon_final/best.pt --exec_horizon 1
-
-# 정지
-ros2 topic pub -1 /dp/enable std_msgs/Bool "{data: false}"
+python3 run.py --ckpt runs/dp_lemon_final/best.pt \
+    --exec_horizon 16 --ddim_steps 10 --require_enable 0
 ```
+
+`--require_enable 0` 이면 램프 2초 후 바로 발행하고 `Ctrl+C` 로 정지한다.
+발판으로 켜고 끄려면(권장) `foot_pedal_glove.py` 를 띄우고
+`--enable_topic /teleop/hand_engage/right` — 오른쪽=ON, 왼쪽=OFF 가 킬스위치가 된다.
+enable 구독은 latch(TRANSIENT_LOCAL)라 늦게 붙어도 발판의 마지막 상태를 받는다.
+
+> `ros2 topic pub -1` 로 켜면 discovery 경쟁으로 유실될 수 있다. `-r 2` 로 반복 발행할 것.
+
+### 실기에서 볼 것
+
+- `en=1` 인가 (0이면 인게이지가 안 된 것 — 계산만 하고 발행하지 않는다)
+- `|Δ|max` 가 램프 후 수백 count 이하로 줄어드는가 (줄지 않으면 손이 타겟을 안 따라온다)
+- `infer` 정상 상태 115~130ms. `exec_horizon=16` 은 청크가 800ms 라 여유가 크다
 
 가드는 전부 켜져 있다: 관절 한계(글러브 텔레옵 표), 속도 12000 count/s(학습 데이터
 실측 p99.9), 시작 2초 램프, obs 0.3초 워치독, `/dp/enable` 게이팅, 중복 퍼블리셔 감지.
