@@ -116,6 +116,7 @@ class FoundationPoseNode(Node):
         host, port = a.server.rsplit(":", 1)
         self.client = FPClient(host, int(port))
         self.sam = None
+        self.seeded = False      # 스트림 트래커에 씨앗을 심었는지
         self.registered = False
         self.n = 0
         self.n_ok = 0
@@ -184,17 +185,37 @@ class FoundationPoseNode(Node):
             self.registered = False
             self.get_logger().info("재선택 — 자동 시드로 되돌림")
 
-    # ── 초기 마스크 (SAM2) ─────────────────────────────────────────────────
+    # ── SAM2 (fruit-manipulation 의 스트림 트래커 그대로) ────────────────────
     def _load_sam2(self):
+        """live_bbox_gui.py 와 같은 Sam2StreamTracker 를 쓴다.
+
+        image predictor 로 매번 새로 프롬프트하면 프레임마다 마스크 입도가 흔들린다.
+        video predictor 는 메모리뱅크로 **처음 고른 그 물체**를 이어서 추적하므로
+        경계가 부드럽고 튀지 않는다 — 기존 파이프라인에서 검증된 방식이다.
+        """
+        sys.path.insert(0, FM_ROOT)                                   # in_hand_tracker
         sys.path.insert(0, os.path.join(FM_ROOT, "third_party", "sam2"))
         import torch
-        from sam2.build_sam import build_sam2
-        from sam2.sam2_image_predictor import SAM2ImagePredictor
         dev = "cuda" if torch.cuda.is_available() else "cpu"
         self.get_logger().info(f"SAM2 로드 중 ({dev}) — {SAM2_CKPT}")
-        model = build_sam2(SAM2_CFG, SAM2_CKPT, device=dev)
-        self.sam = SAM2ImagePredictor(model)
-        self.get_logger().info("SAM2 준비 완료")
+        from in_hand_tracker.perception.sam2_stream import Sam2StreamTracker
+        self.sam = Sam2StreamTracker(SAM2_CKPT, SAM2_CFG, device=dev)
+        self.seeded = False
+        self.get_logger().info("SAM2 스트림 트래커 준비 완료 (video predictor + 메모리)")
+
+    def _trim_by_depth(self, m: np.ndarray, depth: np.ndarray):
+        """마스크가 물체 경계를 넘어 문 배경 화소를 깊이로 잘라낸다.
+
+        안 자르면 점군이 시선 방향으로 늘어나 크기 실측이 무너진다(실측 826mm).
+        """
+        m = m & (depth > self.a.depth_band[0]) & (depth < self.a.depth_band[1])
+        dm = depth[m]
+        dm = dm[dm > 0]
+        if dm.size < 20:
+            return m
+        med = float(np.median(dm))
+        slab = 1.5 * float(max(self.a.abc))
+        return m & (np.abs(depth - med) <= slab)
 
     def _seed_point(self, depth: np.ndarray):
         """ROI + 깊이대역 안에서 가장 가까운 덩어리의 무게중심 → SAM2 점 프롬프트.
@@ -248,6 +269,27 @@ class FoundationPoseNode(Node):
         a, b = float(ext[0]), float(ext[1])
         return [a, b, b]                                          # 세 번째는 회전대칭 가정
 
+    def _update_size(self, m: np.ndarray, depth: np.ndarray, quiet: bool = False):
+        """마스크로 크기를 재서 /fruit/size 값을 갱신. 말이 안 되면 버린다."""
+        meas = self._measure_size(m, depth)
+        nom = float(max(self.a.abc))
+        if meas and not (nom / 3.0 <= meas[0] <= nom * 3.0):
+            # 마스크가 물체를 벗어나면 여기서 걸린다. 엉터리 값이 HDF5 에 들어가는
+            # 것보다 CAD 공칭치를 쓰는 게 낫다.
+            self.get_logger().warn(
+                f"비전 실측 {[round(x*1000, 1) for x in meas]} mm 가 CAD 공칭 "
+                f"{nom*1000:.0f} mm 와 3배 이상 차이 → 버림", throttle_duration_sec=5.0)
+            return
+        if not meas:
+            return
+        # 프레임마다 조금씩 흔들리므로 지수평균으로 눕힌다 (크기는 원래 상수여야 한다)
+        self.size = meas if self.size is None else [
+            0.85 * s + 0.15 * v for s, v in zip(self.size, meas)]
+        if not quiet:
+            self.get_logger().info(
+                f"비전 실측 크기: {[round(x*1000, 1) for x in meas]} mm "
+                f"(CAD 공칭 {[round(x*1000, 1) for x in self.a.abc]} mm)")
+
     def _depth_at(self, depth: np.ndarray, pt, r: int = 5):
         """시드 픽셀 주변의 유효 깊이 중앙값 [m]. 없으면 None."""
         h, w = depth.shape
@@ -271,76 +313,45 @@ class FoundationPoseNode(Node):
                 return None, "ROI/깊이대역 안에 물체 없음"
         if self.sam is None:
             self._load_sam2()
-        self.sam.set_image(rgb)
-        masks, scores, _ = self.sam.predict(
-            point_coords=np.array([pt], dtype=np.float32),
-            point_labels=np.array([1], dtype=np.int32),
-            multimask_output=True)
 
-        # SAM2 는 세 가지 입도(부분/일부/전체)를 낸다. 점수만 보고 고르면 과일의
-        # 한 조각을 집어 마스크가 실제 크기의 절반쯤 되는 일이 잦다(실측 확인).
-        # 물체 크기와 깊이를 알고 있으니 화면에서 차지해야 할 면적을 계산해
-        # 거기에 가장 가까운 후보를 고른다.
-        zc = self._depth_at(depth, pt)
-        expect = None
-        if zc:
-            px = self.K[0, 0] * float(max(self.a.abc)) / zc      # 장축의 화면 길이
-            expect = np.pi / 4.0 * px * px                       # 타원 근사 면적
-        cand = []
-        for i, mk in enumerate(masks):
-            mm = mk.astype(bool) & (depth > self.a.depth_band[0]) & (depth < self.a.depth_band[1])
-            n = int(mm.sum())
-            if n < self.a.min_mask_px:
-                continue
-            # 기대 면적과의 로그 비율 (작아도 커도 벌점) — 없으면 점수만 사용
-            pen = abs(np.log(n / expect)) if expect else 0.0
-            cand.append((pen - 0.5 * float(scores[i]), i, n, mm))
-        if not cand:
-            return None, "쓸 만한 마스크 없음 (전부 너무 작음)"
-        cand.sort(key=lambda c: c[0])
-        _, best, npx, m = cand[0]
+        # 스트림 트래커를 그 점으로 다시 씨앗 심는다. 이후 프레임은 _track_mask 가
+        # 메모리로 이어받으므로 여기서 다시 프롬프트할 일이 없다.
+        self.sam.reset()
+        self.sam.load_first_frame(rgb)
+        raw = self.sam.add_prompt(points=[(float(pt[0]), float(pt[1]))], labels=[1])
+        self.seeded = True
 
-        # 마스크가 물체 경계를 조금 넘어 배경(테이블·벽)을 물면, 그 화소들의 깊이가
-        # 물체보다 훨씬 멀어 점군이 시선 방향으로 길게 늘어난다(실측에서 0.8m 나옴).
-        # 물체 깊이 중앙값 기준으로 물체 크기의 1.5배 밖은 잘라낸다.
-        dm = depth[m]
-        dm = dm[dm > 0]
-        if dm.size >= 20:
-            med = float(np.median(dm))
-            slab = 1.5 * float(max(self.a.abc))
-            m = m & (np.abs(depth - med) <= slab) & (depth > 0)
-            if int(m.sum()) < self.a.min_mask_px:
-                return None, "깊이로 잘라내니 화소가 부족 (마스크가 물체를 벗어남)"
-            if int(m.sum()) < npx:
-                self.get_logger().info(
-                    f"배경 깊이 제거: {npx} → {int(m.sum())}px "
-                    f"(물체 깊이 {med:.3f}m ±{slab*100:.0f}cm)")
-        if expect:
-            self.get_logger().info(
-                f"마스크 후보 {[c[2] for c in sorted(cand, key=lambda c: c[1])]}px "
-                f"/ 기대 {int(expect)}px → #{best} 선택")
-        # (깊이 유효 화소만 남기는 처리는 위 후보 평가에서 이미 끝났다)
+        m = self._trim_by_depth(np.asarray(raw).astype(bool), depth)
+        if int(m.sum()) < self.a.min_mask_px:
+            self.seeded = False
+            return None, f"마스크가 너무 작음 ({int(m.sum())}px)"
         self.last_mask = m
         if self.a.size_source == "vision":
-            meas = self._measure_size(m, depth)
-            nom = float(max(self.a.abc))
-            if meas and not (nom / 3.0 <= meas[0] <= nom * 3.0):
-                # 마스크가 물체가 아니라 테이블 같은 걸 잡으면 여기서 걸린다.
-                # 말도 안 되는 값을 /fruit/size 로 내보내면 학습 데이터가 오염된다.
-                self.get_logger().warn(
-                    f"비전 실측 {[round(x*1000, 1) for x in meas]} mm 가 CAD 공칭 "
-                    f"{nom*1000:.0f} mm 와 3배 이상 차이 → 버리고 공칭치 사용 "
-                    f"(마스크가 물체를 벗어났을 가능성)")
-                meas = None
-            if meas:
-                self.size = meas
-                self.get_logger().info(
-                    f"비전 실측 크기: {[round(x*1000, 1) for x in meas]} mm "
-                    f"(CAD 공칭 {[round(x*1000, 1) for x in self.a.abc]} mm)")
+            self._update_size(m, depth)
         self.get_logger().info(
-            f"SAM2 마스크: {int(m.sum())}px, score={scores[best]:.3f}, seed=({pt[0]:.0f},{pt[1]:.0f})"
-            f"{' [클릭]' if self.click_pt is not None else ''}")
+            f"SAM2 시드: {int(m.sum())}px, seed=({pt[0]:.0f},{pt[1]:.0f})"
+            f"{' [클릭]' if self.click_pt is not None else ''} — 이후 메모리로 추적")
         return m, None
+
+    def _track_mask(self, rgb: np.ndarray, depth: np.ndarray):
+        """씨앗 심은 뒤 매 프레임: 메모리뱅크로 같은 물체를 이어서 세그.
+
+        FoundationPose 자세추정에는 첫 프레임 마스크만 필요하지만, 이 마스크가
+        계속 있으면 (1) 화면 오버레이가 부드럽고 (2) 크기를 매 프레임 다시 잴 수
+        있다. 기존 live_bbox_gui.py 와 같은 방식이다.
+        """
+        if not self.seeded:
+            return None
+        try:
+            m = np.asarray(self.sam.track(rgb)).astype(bool)
+        except Exception as e:                                   # noqa: BLE001
+            self.get_logger().warn(f"SAM2 추적 실패: {e}", throttle_duration_sec=5.0)
+            return None
+        m = self._trim_by_depth(m, depth)
+        if int(m.sum()) < self.a.min_mask_px:
+            return None
+        self.last_mask = m
+        return m
 
     # ── 물체 교체 / 재등록 ─────────────────────────────────────────────────
     def _on_reset(self, msg: String):
@@ -434,6 +445,11 @@ class FoundationPoseNode(Node):
                 self.get_logger().warn(f"초기 마스크 실패: {err}", throttle_duration_sec=3.0)
                 return
             req = {"cmd": "register", "rgb": rgb, "depth": depth, "K": self.K, "mask": mask}
+        else:
+            # 씨앗 심은 물체를 메모리로 계속 따라간다 (오버레이·크기 갱신용)
+            m = self._track_mask(rgb, depth)
+            if m is not None and self.a.size_source == "vision":
+                self._update_size(m, depth, quiet=True)
 
         try:
             rep = self.client.call(req)
