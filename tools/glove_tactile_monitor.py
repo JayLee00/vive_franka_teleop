@@ -66,6 +66,7 @@ class Shared:
         self.tac_max = None        # (4,)  손가락별 최대 |압력|
         self.tac_n = 0
         self.tac_err = None
+        self.tac_warn = None       # payload 길이가 기대와 다를 때 경고
 
 
 def glove_reader(sh: Shared, port: str):
@@ -181,6 +182,16 @@ def tactile_reader(sh: Shared, port: str, calibrate: bool):
                 sample = make_timestamped_sample(
                     seq, latest, read_start_mono_ns=recv_ns, read_end_mono_ns=recv_ns)
                 decoded = decode_auto_push_sample(sample, cfg, decode_tactile=True)
+                # payload 가 기대보다 짧으면 없는 센서는 조용히 0.00 으로 표시된다
+                # (범위 밖 → None → nan_to_num). 센서 미연결과 구분되게 알린다.
+                got, want = decoded["actual_payload_len"], decoded["expected_payload_len"]
+                if got != want:
+                    stride = decoded["sensor_stride"] or 1
+                    with sh.lock:
+                        sh.tac_warn = (
+                            f"payload {got}B ≠ 기대 {want}B "
+                            f"(센서 {got // stride}/{decoded['sensor_count']}개분) "
+                            f"— 나머지 센서는 값 없이 0.00 으로 표시됨")
                 arrays = decoded_to_numpy_arrays(decoded, cfg)
                 tac = np.nan_to_num(arrays["tactile"])          # (4,127,3)
                 with sh.lock:
@@ -237,6 +248,7 @@ def main():
             with sh.lock:
                 g, gn, ge = sh.glove, sh.glove_n, sh.glove_err
                 ft, res, tmax, tn, te = sh.ft, sh.res, sh.tac_max, sh.tac_n, sh.tac_err
+                tw = sh.tac_warn
             ghz, thz = (gn - pg) / dt, (tn - pt) / dt
             pg, pt = gn, tn
 
@@ -261,6 +273,8 @@ def main():
                     for i in range(SENSOR_NUM)))
                 print("  촉각최대: " + "  ".join(
                     f"f{i}={tmax[i]:7.2f}" for i in range(SENSOR_NUM)))
+                if tw:
+                    print(f"  촉각 ⚠ {tw}")
 
             if a.sec > 0 and now - t0 >= a.sec:
                 break
