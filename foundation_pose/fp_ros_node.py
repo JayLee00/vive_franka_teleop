@@ -35,7 +35,7 @@ from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Float32MultiArray, String
 
 import message_filters
 
@@ -121,10 +121,15 @@ class FoundationPoseNode(Node):
         self.t_last = time.perf_counter()
         self.last_pose = None
 
+        self.lost = 0            # 연속 추적실패 프레임 수
+        self.n_reg = 0           # register 횟수
+
         ns = a.ns.rstrip("/")
         self.pub_pose = self.create_publisher(PoseStamped, f"{ns}/pose", QOS)
         self.pub_size = self.create_publisher(Float32MultiArray, f"{ns}/size", QOS)
-        self.get_logger().info(f"발행: {ns}/pose, {ns}/size")
+        # 물체가 바뀌었을 때: 빈 문자열=SAM2 재세그+재등록, 경로=메시 교체 후 재등록
+        self.create_subscription(String, f"{ns}/reset", self._on_reset, 10)
+        self.get_logger().info(f"발행: {ns}/pose, {ns}/size   재등록: {ns}/reset")
 
         self.create_subscription(CameraInfo, a.info_topic, self._on_info, QOS)
         sub_c = message_filters.Subscriber(self, Image, a.color_topic, qos_profile=QOS)
@@ -195,6 +200,54 @@ class FoundationPoseNode(Node):
             f"SAM2 마스크: {int(m.sum())}px, score={scores[best]:.3f}, seed=({pt[0]:.0f},{pt[1]:.0f})")
         return m, None
 
+    # ── 물체 교체 / 재등록 ─────────────────────────────────────────────────
+    def _on_reset(self, msg: String):
+        """물체가 바뀌었을 때 호출. data 가 비면 재세그만, 경로면 메시까지 교체.
+
+            ros2 topic pub --once /fruit_fp/reset std_msgs/String '{data: ""}'
+            ros2 topic pub --once /fruit_fp/reset std_msgs/String '{data: "/…/apple.obj"}'
+        """
+        path = msg.data.strip()
+        if path and self.client.sock is not None:
+            try:
+                rep = self.client.call({"cmd": "set_mesh", "mesh": path})
+                if not rep.get("ok"):
+                    self.get_logger().error(f"메시 교체 실패: {rep.get('err')}")
+                    return
+                self.get_logger().info(f"메시 교체됨: {path}")
+            except Exception as e:                                # noqa: BLE001
+                self.get_logger().error(f"메시 교체 호출 실패: {e}")
+                self.client.close()
+                return
+        self.registered = False        # 다음 프레임에서 SAM2 로 다시 마스크
+        self.lost = 0
+        self.get_logger().info("재등록 요청 — 다음 프레임에서 SAM2 재세그멘테이션")
+
+    def _tracking_ok(self, T: np.ndarray, depth: np.ndarray) -> bool:
+        """추정된 자세가 아직 실제 물체 위에 있는지 값싸게 검사.
+
+        자세의 원점은 메시 **중심**이지만 깊이센서가 보는 건 **앞면**이다. 볼록한
+        물체라면 관측 깊이는 [z-반지름, z+반지름] 안에 있어야 하므로, 여기에
+        여유(check_tol)를 더해 판정한다. 반지름을 안 빼면 늘 이탈로 오판해
+        재등록 루프에 빠진다(실측으로 확인).
+        """
+        z = float(T[2, 3])
+        if z <= 0:
+            return False
+        u = self.K[0, 0] * T[0, 3] / z + self.K[0, 2]
+        v = self.K[1, 1] * T[1, 3] / z + self.K[1, 2]
+        h, w = depth.shape
+        ui, vi = int(round(u)), int(round(v))
+        if not (0 <= ui < w and 0 <= vi < h):
+            return False
+        r = self.a.check_win
+        patch = depth[max(0, vi - r):vi + r + 1, max(0, ui - r):ui + r + 1]
+        valid = patch[patch > 0]
+        if valid.size < 10:
+            return False               # 물체 자리에 깊이가 없다 = 사라졌다
+        radius = 0.5 * max(self.a.abc)
+        return abs(float(np.median(valid)) - z) <= radius + self.a.check_tol
+
     # ── 콜백 ──────────────────────────────────────────────────────────────
     def _on_info(self, msg: CameraInfo):
         if self.K is None:
@@ -240,9 +293,24 @@ class FoundationPoseNode(Node):
             return
         if not self.registered:
             self.registered = True
-            self.get_logger().info("초기 등록(register) 완료 — 이후 트래킹")
+            self.n_reg += 1
+            self.get_logger().info(f"등록(register) 완료 #{self.n_reg} — 이후 트래킹")
 
         T = np.asarray(rep["pose"], dtype=np.float64)
+
+        # 물체가 바뀌거나 트래커가 흘러가면 자동으로 다시 등록한다
+        if self.a.auto_reset and self._tracking_ok(T, depth):
+            self.lost = 0
+        elif self.a.auto_reset:
+            self.lost += 1
+            if self.lost >= self.a.lost_patience:
+                self.get_logger().warn(
+                    f"추적 이탈 {self.lost}프레임 — SAM2 로 재등록합니다")
+                self.registered = False
+                self.lost = 0
+                return          # 이 프레임은 버리고 다음 프레임에서 재세그
+            return              # 의심스러운 자세는 발행하지 않는다
+
         self.n_ok += 1
         self.last_pose = T
         self._publish(T, c_msg.header)
@@ -291,6 +359,15 @@ def main():
     ap.add_argument("--near-slab", type=float, default=0.05,
                     help="가장 가까운 깊이로부터 이 두께[m] 안쪽만 시드로 사용")
     ap.add_argument("--min-mask-px", type=int, default=400)
+    ap.add_argument("--no-auto-reset", dest="auto_reset", action="store_false",
+                    default=True,
+                    help="추적 이탈 시 자동 재등록 끄기 (기본은 켬)")
+    ap.add_argument("--check-tol", type=float, default=0.05,
+                    help="자세 z 와 관측 깊이 중앙값의 허용 차 [m]")
+    ap.add_argument("--check-win", type=int, default=6,
+                    help="깊이 비교 창 반경 [px]")
+    ap.add_argument("--lost-patience", type=int, default=30,
+                    help="이 프레임 수만큼 연속 이탈하면 재등록 (register 가 ~1.3s 라 넉넉히)")
     ap.add_argument("--diameter", type=float, default=0.070, help="과일 지름 [m]")
     ap.add_argument("--abc", default=None, help="축별 지름 'a,b,c' [m]")
     a = ap.parse_args()

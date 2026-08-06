@@ -93,8 +93,27 @@ class Engine:
                     "registered": self.registered}
 
         if cmd == "reset":
+            # 다음 프레임에서 마스크를 받아 다시 register 한다
             self.registered = False
             return {"ok": True, "pose": None, "ms": 0.0, "err": None}
+
+        if cmd == "set_mesh":
+            # 물체가 바뀌면 메시도 바뀌어야 한다(model-based 라서).
+            # reset_object 는 지름·복셀크기·회전격자를 새 메시로 다시 만든다.
+            import trimesh
+            path = req["mesh"]
+            if not os.path.isfile(path):
+                return {"ok": False, "pose": None, "ms": 0.0,
+                        "err": f"메시 파일 없음: {path}"}
+            m = trimesh.load(path, force="mesh")
+            self.est.reset_object(model_pts=m.vertices, model_normals=m.vertex_normals,
+                                  mesh=m)
+            self.mesh = m
+            self.registered = False
+            print(f"[fp_server] 메시 교체: {path} (v={len(m.vertices)}, "
+                  f"extents={m.extents})", flush=True)
+            return {"ok": True, "pose": None, "ms": (time.perf_counter() - t0) * 1e3,
+                    "err": None}
 
         rgb = req["rgb"]
         depth = np.ascontiguousarray(req["depth"], dtype=np.float32)
