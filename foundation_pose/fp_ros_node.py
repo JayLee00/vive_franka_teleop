@@ -325,6 +325,9 @@ class FoundationPoseNode(Node):
         if int(m.sum()) < self.a.min_mask_px:
             self.seeded = False
             return None, f"마스크가 너무 작음 ({int(m.sum())}px)"
+        # 씨앗을 심었으면 클릭 지점은 소임을 다했다. 남겨두면 나중에 재등록이 걸릴 때
+        # 물체가 이미 옮겨갔는데도 옛 좌표로 다시 씨앗을 심어 엉뚱한 걸 잡는다.
+        self.click_pt = None
         self.last_mask = m
         if self.a.size_source == "vision":
             self._update_size(m, depth)
@@ -511,9 +514,15 @@ class FoundationPoseNode(Node):
             return
         t = self.last_pose[:3, 3]
         q = mat_to_quat(self.last_pose[:3, :3])
+        # 마스크 중심을 같이 찍는다 — 이게 물체를 따라 움직여야 세그가 추적 중인 것이다
+        seg = ""
+        if self.last_mask is not None and self.last_mask.any():
+            ys, xs = np.nonzero(self.last_mask)
+            seg = (f"  seg=({xs.mean():.0f},{ys.mean():.0f}) "
+                   f"{int(self.last_mask.sum())}px")
         self.get_logger().info(
             f"{hz:4.1f}Hz  pos=[{t[0]:+.3f},{t[1]:+.3f},{t[2]:+.3f}]m  "
-            f"quat=[{q[0]:+.3f},{q[1]:+.3f},{q[2]:+.3f},{q[3]:+.3f}]")
+            f"quat=[{q[0]:+.3f},{q[1]:+.3f},{q[2]:+.3f},{q[3]:+.3f}]{seg}")
 
 
 def main():
