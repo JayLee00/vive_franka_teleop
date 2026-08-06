@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""FoundationPose ROS2 브리지 — **호스트에서** 실행된다.
+
+    카메라 토픽 ─┬─ (첫 프레임) SAM2 로 과일 마스크
+                 └─ RGB-D + K ──TCP──> 컨테이너의 fp_server ──> 4x4 pose
+                                                                   │
+                          /<ns>/pose (PoseStamped), /<ns>/size ◄───┘
+
+논문대로 **마스크는 첫 프레임에만** 필요하다("the object is detected using an
+off-the-shelf method such as Mask R-CNN or CNOS"). 이후에는 직전 자세를 조건으로
+크롭해 추적하므로 매 프레임 세그멘테이션이 필요 없다. 그래서 기존 SAM2 를 그대로
+초기화용으로만 쓴다.
+
+기본 발행 네임스페이스는 기존 파이프라인(/fruit/*)과 **겹치지 않게** /fruit_fp/* 다.
+`--ns /fruit` 로 바꾸면 기존 fruit_overlay.py 가 그대로 받아 그린다(드롭인 비교용).
+
+실행: run_foundation_pose.sh 가 알아서 띄운다. 수동으로는
+    python3 fp_ros_node.py --server 127.0.0.1:5577 --diameter 0.07
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import pickle
+import socket
+import struct
+import sys
+import time
+
+import numpy as np
+import rclpy
+from cv_bridge import CvBridge
+from geometry_msgs.msg import PoseStamped
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import CameraInfo, Image
+from std_msgs.msg import Float32MultiArray
+
+import message_filters
+
+HDR = struct.Struct("<Q")
+QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                 history=HistoryPolicy.KEEP_LAST, depth=1)
+
+FM_ROOT = "/home/js/Desktop/vive_franka_teleop/fruit-manipulation"
+SAM2_CKPT = os.path.join(FM_ROOT, "sam2.1_hiera_tiny.pt")
+SAM2_CFG = "configs/sam2.1/sam2.1_hiera_t.yaml"
+
+
+# ── fp_server 클라이언트 ────────────────────────────────────────────────────
+class FPClient:
+    def __init__(self, host: str, port: int):
+        self.addr = (host, port)
+        self.sock = None
+
+    def connect(self, timeout: float = 5.0):
+        s = socket.create_connection(self.addr, timeout=timeout)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        s.settimeout(30.0)
+        self.sock = s
+
+    def call(self, req: dict) -> dict:
+        body = pickle.dumps(req, protocol=pickle.HIGHEST_PROTOCOL)
+        self.sock.sendall(HDR.pack(len(body)) + body)
+        head = self._recv(HDR.size)
+        (n,) = HDR.unpack(head)
+        return pickle.loads(self._recv(n))
+
+    def _recv(self, n: int) -> bytes:
+        buf = bytearray()
+        while len(buf) < n:
+            c = self.sock.recv(n - len(buf))
+            if not c:
+                raise ConnectionError("fp_server 연결 끊김")
+            buf.extend(c)
+        return bytes(buf)
+
+    def close(self):
+        try:
+            if self.sock:
+                self.sock.close()
+        except Exception:
+            pass
+        self.sock = None
+
+
+def mat_to_quat(R: np.ndarray):
+    """3x3 회전행렬 → 쿼터니언 [x,y,z,w]."""
+    t = np.trace(R)
+    if t > 0:
+        s = np.sqrt(t + 1.0) * 2.0
+        return ((R[2, 1] - R[1, 2]) / s, (R[0, 2] - R[2, 0]) / s,
+                (R[1, 0] - R[0, 1]) / s, 0.25 * s)
+    i = int(np.argmax(np.diag(R)))
+    if i == 0:
+        s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+        return (0.25 * s, (R[0, 1] + R[1, 0]) / s, (R[0, 2] + R[2, 0]) / s,
+                (R[2, 1] - R[1, 2]) / s)
+    if i == 1:
+        s = np.sqrt(1.0 - R[0, 0] + R[1, 1] - R[2, 2]) * 2.0
+        return ((R[0, 1] + R[1, 0]) / s, 0.25 * s, (R[1, 2] + R[2, 1]) / s,
+                (R[0, 2] - R[2, 0]) / s)
+    s = np.sqrt(1.0 - R[0, 0] - R[1, 1] + R[2, 2]) * 2.0
+    return ((R[0, 2] + R[2, 0]) / s, (R[1, 2] + R[2, 1]) / s, 0.25 * s,
+            (R[1, 0] - R[0, 1]) / s)
+
+
+class FoundationPoseNode(Node):
+    def __init__(self, a):
+        super().__init__("foundation_pose")
+        self.a = a
+        self.bridge = CvBridge()
+        self.K = None
+        host, port = a.server.rsplit(":", 1)
+        self.client = FPClient(host, int(port))
+        self.sam = None
+        self.registered = False
+        self.n = 0
+        self.n_ok = 0
+        self.t_last = time.perf_counter()
+        self.last_pose = None
+
+        ns = a.ns.rstrip("/")
+        self.pub_pose = self.create_publisher(PoseStamped, f"{ns}/pose", QOS)
+        self.pub_size = self.create_publisher(Float32MultiArray, f"{ns}/size", QOS)
+        self.get_logger().info(f"발행: {ns}/pose, {ns}/size")
+
+        self.create_subscription(CameraInfo, a.info_topic, self._on_info, QOS)
+        sub_c = message_filters.Subscriber(self, Image, a.color_topic, qos_profile=QOS)
+        sub_d = message_filters.Subscriber(self, Image, a.depth_topic, qos_profile=QOS)
+        self.sync = message_filters.ApproximateTimeSynchronizer(
+            [sub_c, sub_d], queue_size=5, slop=0.05)
+        self.sync.registerCallback(self._on_rgbd)
+
+        self.create_timer(2.0, self._status)
+
+    # ── 초기 마스크 (SAM2) ─────────────────────────────────────────────────
+    def _load_sam2(self):
+        sys.path.insert(0, os.path.join(FM_ROOT, "third_party", "sam2"))
+        import torch
+        from sam2.build_sam import build_sam2
+        from sam2.sam2_image_predictor import SAM2ImagePredictor
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        self.get_logger().info(f"SAM2 로드 중 ({dev}) — {SAM2_CKPT}")
+        model = build_sam2(SAM2_CFG, SAM2_CKPT, device=dev)
+        self.sam = SAM2ImagePredictor(model)
+        self.get_logger().info("SAM2 준비 완료")
+
+    def _seed_point(self, depth: np.ndarray):
+        """ROI + 깊이대역 안에서 가장 가까운 덩어리의 무게중심 → SAM2 점 프롬프트.
+
+        기존 live_bbox_gui.py 의 --roi-frac / --depth-band 와 같은 발상이다.
+        """
+        h, w = depth.shape
+        cx, cy, fw, fh = self.a.roi_frac
+        x0, x1 = int((cx - fw / 2) * w), int((cx + fw / 2) * w)
+        y0, y1 = int((cy - fh / 2) * h), int((cy + fh / 2) * h)
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(w, x1), min(h, y1)
+
+        roi = depth[y0:y1, x0:x1]
+        lo, hi = self.a.depth_band
+        valid = (roi > lo) & (roi < hi)
+        if valid.sum() < 200:
+            return None
+        # 가장 가까운 5% 깊이만 남겨 (배경 테이블 제거) 무게중심을 잡는다
+        thr = np.percentile(roi[valid], 5) + self.a.near_slab
+        near = valid & (roi <= thr)
+        if near.sum() < 100:
+            near = valid
+        ys, xs = np.nonzero(near)
+        return (float(xs.mean()) + x0, float(ys.mean()) + y0)
+
+    def _make_mask(self, rgb: np.ndarray, depth: np.ndarray):
+        pt = self._seed_point(depth)
+        if pt is None:
+            return None, "ROI/깊이대역 안에 물체 없음"
+        if self.sam is None:
+            self._load_sam2()
+        self.sam.set_image(rgb)
+        masks, scores, _ = self.sam.predict(
+            point_coords=np.array([pt], dtype=np.float32),
+            point_labels=np.array([1], dtype=np.int32),
+            multimask_output=True)
+        best = int(np.argmax(scores))
+        m = masks[best].astype(bool)
+        if m.sum() < self.a.min_mask_px:
+            return None, f"마스크가 너무 작음 ({int(m.sum())}px)"
+        # 깊이가 없는 화소는 FoundationPose 초기 병진 추정을 망친다 → 제거
+        m &= (depth > self.a.depth_band[0]) & (depth < self.a.depth_band[1])
+        if m.sum() < self.a.min_mask_px:
+            return None, "깊이 유효 화소 부족"
+        self.get_logger().info(
+            f"SAM2 마스크: {int(m.sum())}px, score={scores[best]:.3f}, seed=({pt[0]:.0f},{pt[1]:.0f})")
+        return m, None
+
+    # ── 콜백 ──────────────────────────────────────────────────────────────
+    def _on_info(self, msg: CameraInfo):
+        if self.K is None:
+            self.K = np.array(msg.k, dtype=np.float64).reshape(3, 3)
+            self.get_logger().info(f"K 수신: fx={self.K[0,0]:.1f} fy={self.K[1,1]:.1f} "
+                                   f"cx={self.K[0,2]:.1f} cy={self.K[1,2]:.1f}")
+
+    def _on_rgbd(self, c_msg: Image, d_msg: Image):
+        if self.K is None:
+            return
+        if self.client.sock is None:
+            try:
+                self.client.connect()
+                self.get_logger().info(f"fp_server 접속: {self.a.server}")
+            except Exception as e:                                # noqa: BLE001
+                self.get_logger().warn(f"fp_server 접속 실패: {e}", throttle_duration_sec=5.0)
+                return
+
+        rgb = self.bridge.imgmsg_to_cv2(c_msg, "rgb8")
+        d = self.bridge.imgmsg_to_cv2(d_msg, "passthrough")
+        depth = (d.astype(np.float32) / 1000.0) if d.dtype == np.uint16 else d.astype(np.float32)
+        depth[(depth < self.a.depth_band[0]) | (depth > self.a.depth_band[1])] = 0.0
+
+        req = {"cmd": "track", "rgb": rgb, "depth": depth, "K": self.K}
+        if not self.registered:
+            mask, err = self._make_mask(rgb, depth)
+            if mask is None:
+                self.get_logger().warn(f"초기 마스크 실패: {err}", throttle_duration_sec=3.0)
+                return
+            req = {"cmd": "register", "rgb": rgb, "depth": depth, "K": self.K, "mask": mask}
+
+        try:
+            rep = self.client.call(req)
+        except Exception as e:                                    # noqa: BLE001
+            self.get_logger().error(f"fp_server 호출 실패: {e} — 재접속")
+            self.client.close()
+            self.registered = False
+            return
+
+        self.n += 1
+        if not rep.get("ok"):
+            self.get_logger().warn(f"추정 실패: {rep.get('err')}", throttle_duration_sec=3.0)
+            return
+        if not self.registered:
+            self.registered = True
+            self.get_logger().info("초기 등록(register) 완료 — 이후 트래킹")
+
+        T = np.asarray(rep["pose"], dtype=np.float64)
+        self.n_ok += 1
+        self.last_pose = T
+        self._publish(T, c_msg.header)
+
+    def _publish(self, T: np.ndarray, header):
+        q = mat_to_quat(T[:3, :3])
+        p = PoseStamped()
+        p.header.stamp = header.stamp
+        p.header.frame_id = header.frame_id or self.a.frame_id
+        p.pose.position.x, p.pose.position.y, p.pose.position.z = (float(v) for v in T[:3, 3])
+        p.pose.orientation.x, p.pose.orientation.y = float(q[0]), float(q[1])
+        p.pose.orientation.z, p.pose.orientation.w = float(q[2]), float(q[3])
+        self.pub_pose.publish(p)
+
+        s = Float32MultiArray()
+        s.data = [float(x) for x in self.a.abc]
+        self.pub_size.publish(s)
+
+    def _status(self):
+        now = time.perf_counter()
+        hz = self.n / max(1e-9, now - self.t_last)
+        self.n, self.t_last = 0, now
+        if self.last_pose is None:
+            self.get_logger().warn(f"아직 자세 없음 (K={'O' if self.K is not None else 'X'}, "
+                                   f"등록={'O' if self.registered else 'X'})")
+            return
+        t = self.last_pose[:3, 3]
+        q = mat_to_quat(self.last_pose[:3, :3])
+        self.get_logger().info(
+            f"{hz:4.1f}Hz  pos=[{t[0]:+.3f},{t[1]:+.3f},{t[2]:+.3f}]m  "
+            f"quat=[{q[0]:+.3f},{q[1]:+.3f},{q[2]:+.3f},{q[3]:+.3f}]")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="FoundationPose ROS2 브리지 (호스트)")
+    ap.add_argument("--server", default="127.0.0.1:5577")
+    ap.add_argument("--ns", default="/fruit_fp",
+                    help="발행 네임스페이스. '/fruit' 로 주면 기존 오버레이가 그대로 받는다")
+    ap.add_argument("--color-topic", default="/camera/camera/color/image_fast")
+    ap.add_argument("--depth-topic", default="/camera/camera/aligned_depth_to_color/image_raw")
+    ap.add_argument("--info-topic", default="/camera/camera/color/camera_info")
+    ap.add_argument("--frame-id", default="camera_color_optical_frame")
+    ap.add_argument("--roi-frac", default="0.5,0.5,0.9,0.9",
+                    help="초기 마스크를 찾을 ROI (cx,cy,w,h 비율)")
+    ap.add_argument("--depth-band", default="0.15,1.2", help="유효 깊이 [m] 'min,max'")
+    ap.add_argument("--near-slab", type=float, default=0.05,
+                    help="가장 가까운 깊이로부터 이 두께[m] 안쪽만 시드로 사용")
+    ap.add_argument("--min-mask-px", type=int, default=400)
+    ap.add_argument("--diameter", type=float, default=0.070, help="과일 지름 [m]")
+    ap.add_argument("--abc", default=None, help="축별 지름 'a,b,c' [m]")
+    a = ap.parse_args()
+
+    a.roi_frac = tuple(float(x) for x in a.roi_frac.split(","))
+    a.depth_band = tuple(float(x) for x in a.depth_band.split(","))
+    a.abc = ([float(x) for x in a.abc.split(",")] if a.abc
+             else [a.diameter, a.diameter, a.diameter])
+
+    rclpy.init()
+    node = FoundationPoseNode(a)
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        node.client.close()
+        node.destroy_node()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,10 @@
+# 업스트림 저장소 클론 (setup.sh 가 받는다)
+FoundationPose/
+# 네트워크 가중치 (Google Drive, 수 GB)
+weights/
+# 생성된 메시·텍스처
+assets/
+# 디버그 산출물
+debug/
+*.pyc
+__pycache__/
