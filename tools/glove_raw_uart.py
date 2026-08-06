@@ -25,6 +25,14 @@ CANDIDATES = [115200, 230400, 250000, 460800, 500000, 921600,
               1000000, 1152000, 1500000, 2000000, 3000000]
 NUM_CH = 16
 
+# glove_teleop.py 의 HAND_LIMITS 와 동일 — 채널마다 다르다(전부 0..4096 이 아님).
+HAND_LIMITS = {i: (0, 4096) for i in range(NUM_CH)}
+HAND_LIMITS[1] = (-4096, 4096)          # 엄지 외전
+for _i in (4, 8, 12):                   # 검지/중지/약지 외전
+    HAND_LIMITS[_i] = (-1000, 1000)
+for _i in (3, 7, 11, 15):               # 엄지 IP / 검지·중지·약지 DIP
+    HAND_LIMITS[_i] = (-2048, 4096)
+
 
 def open_at(port, baud):
     """DTR/RTS 를 내린 상태로 연다 (CH340 은 DTR 토글에서 보드가 리셋된다)."""
@@ -53,12 +61,19 @@ def drain(ser, sec):
     chunks, stamps = [], []
     t0 = time.perf_counter()
     while time.perf_counter() - t0 < sec:
-        c = ser.read(1)
-        if not c:
-            continue
-        n = ser.in_waiting
-        if n:
-            c += ser.read(n)
+        try:
+            c = ser.read(1)
+            if not c:
+                continue
+            n = ser.in_waiting
+            if n:
+                c += ser.read(n)
+        except (serial.SerialException, OSError) as e:
+            # 이 글러브는 USB 가 물리적으로 끊긴다(커널 urb -32 → USB disconnect).
+            # 측정 도중 끊기면 죽지 말고 거기까지 모은 걸로 보고한다.
+            print(f"\n!! 측정 {time.perf_counter()-t0:.1f}s 지점에서 USB 끊김: {e}")
+            print("   → journalctl -k | grep -E 'urb stopped|USB disconnect' 확인\n")
+            break
         chunks.append(c)
         stamps.append(time.perf_counter())
     return b"".join(chunks), time.perf_counter() - t0, stamps
@@ -150,13 +165,14 @@ def measure(port, baud, sec, show):
             col = [f[ch] for f in frames]
             lo, hi = min(col), max(col)
             sd = statistics.pstdev(col)
+            clo, chi = HAND_LIMITS[ch]
             note = []
             if lo == hi:
                 note.append("고정값(미사용?)")
-            if lo < 0:
-                note.append("음수 → HAND_LIMITS(0,4096) 에서 0 으로 클램프됨")
-            if hi > 4096:
-                note.append("4096 초과 → 클램프됨")
+            if lo < clo or hi > chi:
+                note.append(f"HAND_LIMITS({clo},{chi}) 벗어남 → 클램프됨")
+            elif lo == clo or hi == chi:
+                note.append(f"HAND_LIMITS 경계({clo if lo == clo else chi})에 붙음 — 포화 의심")
             print(f"{ch:>3} {lo:>7d} {hi:>7d} {statistics.mean(col):>8.1f} "
                   f"{sd:>7.1f}  {', '.join(note)}")
 
