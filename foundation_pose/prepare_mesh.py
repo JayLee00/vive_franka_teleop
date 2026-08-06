@@ -44,10 +44,31 @@ def texture_image(m: trimesh.Trimesh):
     return getattr(mat, "image", None) or getattr(mat, "baseColorTexture", None)
 
 
+def usable_texture(img) -> tuple[bool, str]:
+    """텍스처가 회전 단서로 쓸 만한지 판정.
+
+    ★ .mtl 이나 이미지 파일이 없으면 trimesh 는 조용히 **2x2 단색 placeholder** 를
+    끼워 넣는다. 그러면 '텍스처 있음' 으로 보이지만 실제로는 균일색이라 회색 렌더와
+    다를 게 없다. 크기와 색 다양성을 같이 봐야 이 함정을 잡는다.
+    """
+    if img is None:
+        return False, "없음"
+    try:
+        a = np.array(img.convert("RGB"))
+    except Exception:                                            # noqa: BLE001
+        return False, "읽기 실패"
+    if min(a.shape[:2]) < 8:
+        return False, f"placeholder ({a.shape[1]}x{a.shape[0]}) — .mtl/이미지 누락"
+    if len(np.unique(a.reshape(-1, 3), axis=0)) < 8:
+        return False, f"단색 ({a.shape[1]}x{a.shape[0]}) — 무늬 없음"
+    return True, f"{a.shape[1]}x{a.shape[0]}"
+
+
 def describe(m: trimesh.Trimesh) -> dict:
     """텍스처/색 유무와 크기를 판정."""
     has_tex = isinstance(getattr(m, "visual", None), trimesh.visual.texture.TextureVisuals)
     tex_img = texture_image(m) if has_tex else None
+    tex_ok, tex_note = usable_texture(tex_img)
     has_vcol = False
     if not has_tex:
         try:
@@ -56,7 +77,7 @@ def describe(m: trimesh.Trimesh) -> dict:
             has_vcol = vc is not None and len(np.unique(vc[:, :3], axis=0)) > 1
         except Exception:                                        # noqa: BLE001
             has_vcol = False
-    return {"has_tex": has_tex and tex_img is not None,
+    return {"has_tex": tex_ok, "tex_note": tex_note,
             "has_vcol": has_vcol, "extents": m.extents,
             "nv": len(m.vertices), "nf": len(m.faces)}
 
@@ -74,6 +95,40 @@ def guess_unit(extents: np.ndarray) -> tuple[str, float]:
     if d < 50:
         return "cm", 1e-2
     return "mm", 1e-3
+
+
+def check_obj_sidecars(path: str) -> None:
+    """OBJ 는 3개가 한 벌이다: .obj → (mtllib) → .mtl → (map_Kd) → 이미지.
+
+    어느 하나라도 빠지면 텍스처 없이 로드되므로, 뭐가 없는지 짚어준다.
+    스캐너 앱에서 .obj 만 복사해 오는 실수가 흔하다.
+    """
+    d = os.path.dirname(os.path.abspath(path))
+    mtl_names = []
+    with open(path, "r", errors="ignore") as f:
+        for line in f:
+            if line.lower().startswith("mtllib"):
+                mtl_names += line.split()[1:]
+            elif line.startswith(("v ", "f ")) and mtl_names:
+                break                      # 헤더만 보면 충분
+    if not mtl_names:
+        print("  ⚠ .obj 안에 mtllib 줄이 없습니다 → 재질 파일이 아예 연결 안 됨(텍스처 없음)")
+        return
+    for name in mtl_names:
+        mtl = os.path.join(d, name)
+        if not os.path.isfile(mtl):
+            print(f"  ⚠ 재질 파일이 없습니다: {name}  (.obj 옆에 같이 두세요)")
+            continue
+        maps = []
+        with open(mtl, "r", errors="ignore") as f:
+            for line in f:
+                if line.lower().startswith(("map_kd", "map_ka")):
+                    maps += line.split()[1:]
+        if not maps:
+            print(f"  ⚠ {name} 에 map_Kd(텍스처 이미지) 줄이 없습니다 → 색 없음")
+        for img in maps:
+            p = os.path.join(d, img)
+            print(f"  {'✓' if os.path.isfile(p) else '⚠ 없음:'} 텍스처 이미지 {img}")
 
 
 def main():
@@ -96,6 +151,9 @@ def main():
             print("  → 아이폰 USDZ 는 지원 안 됨. 앱에서 GLB 나 OBJ 로 내보내세요.")
         sys.exit(1)
 
+    if ext == ".obj":
+        check_obj_sidecars(a.src)
+
     m = trimesh.load(a.src, force="mesh")
     info = describe(m)
     unit, to_m = guess_unit(info["extents"])
@@ -103,7 +161,7 @@ def main():
     print(f"입력      : {a.src}")
     print(f"  정점/면 : {info['nv']:,} / {info['nf']:,}")
     print(f"  크기    : {np.round(info['extents'], 4).tolist()}  → 단위 추정 {unit}")
-    print(f"  텍스처  : {'있음 (UV+이미지)' if info['has_tex'] else '없음'}")
+    print(f"  텍스처  : {('있음 ' + info['tex_note']) if info['has_tex'] else ('✗ ' + info['tex_note'])}")
     print(f"  정점색  : {'있음' if info['has_vcol'] else '없음'}")
 
     if not info["has_tex"] and not info["has_vcol"]:
