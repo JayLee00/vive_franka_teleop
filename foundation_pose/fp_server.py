@@ -89,8 +89,10 @@ class Engine:
         t0 = time.perf_counter()
 
         if cmd == "ping":
+            # extents 를 같이 준다 — 노드가 /fruit/size 를 메시 실제 크기로 발행하도록
             return {"ok": True, "pose": None, "ms": 0.0, "err": None,
-                    "registered": self.registered}
+                    "registered": self.registered,
+                    "extents": [float(x) for x in self.mesh.extents]}
 
         if cmd == "reset":
             # 다음 프레임에서 마스크를 받아 다시 register 한다
@@ -113,7 +115,7 @@ class Engine:
             print(f"[fp_server] 메시 교체: {path} (v={len(m.vertices)}, "
                   f"extents={m.extents})", flush=True)
             return {"ok": True, "pose": None, "ms": (time.perf_counter() - t0) * 1e3,
-                    "err": None}
+                    "err": None, "extents": [float(x) for x in m.extents]}
 
         rgb = req["rgb"]
         depth = np.ascontiguousarray(req["depth"], dtype=np.float32)

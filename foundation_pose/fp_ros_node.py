@@ -220,6 +220,16 @@ class FoundationPoseNode(Node):
         ys, xs = np.nonzero(near)
         return (float(xs.mean()) + x0, float(ys.mean()) + y0)
 
+    def _depth_at(self, depth: np.ndarray, pt, r: int = 5):
+        """시드 픽셀 주변의 유효 깊이 중앙값 [m]. 없으면 None."""
+        h, w = depth.shape
+        u, v = int(round(pt[0])), int(round(pt[1]))
+        if not (0 <= u < w and 0 <= v < h):
+            return None
+        patch = depth[max(0, v - r):v + r + 1, max(0, u - r):u + r + 1]
+        valid = patch[patch > 0]
+        return float(np.median(valid)) if valid.size >= 5 else None
+
     def _make_mask(self, rgb: np.ndarray, depth: np.ndarray):
         # 사용자가 찍었으면 그 점이 우선 — 자동 시드가 엉뚱한 걸 잡는 경우를 없앤다
         pt = self.click_pt if self.click_pt is not None else self._seed_point(depth)
@@ -232,14 +242,34 @@ class FoundationPoseNode(Node):
             point_coords=np.array([pt], dtype=np.float32),
             point_labels=np.array([1], dtype=np.int32),
             multimask_output=True)
-        best = int(np.argmax(scores))
-        m = masks[best].astype(bool)
-        if m.sum() < self.a.min_mask_px:
-            return None, f"마스크가 너무 작음 ({int(m.sum())}px)"
-        # 깊이가 없는 화소는 FoundationPose 초기 병진 추정을 망친다 → 제거
-        m &= (depth > self.a.depth_band[0]) & (depth < self.a.depth_band[1])
-        if m.sum() < self.a.min_mask_px:
-            return None, "깊이 유효 화소 부족"
+
+        # SAM2 는 세 가지 입도(부분/일부/전체)를 낸다. 점수만 보고 고르면 과일의
+        # 한 조각을 집어 마스크가 실제 크기의 절반쯤 되는 일이 잦다(실측 확인).
+        # 물체 크기와 깊이를 알고 있으니 화면에서 차지해야 할 면적을 계산해
+        # 거기에 가장 가까운 후보를 고른다.
+        zc = self._depth_at(depth, pt)
+        expect = None
+        if zc:
+            px = self.K[0, 0] * float(max(self.a.abc)) / zc      # 장축의 화면 길이
+            expect = np.pi / 4.0 * px * px                       # 타원 근사 면적
+        cand = []
+        for i, mk in enumerate(masks):
+            mm = mk.astype(bool) & (depth > self.a.depth_band[0]) & (depth < self.a.depth_band[1])
+            n = int(mm.sum())
+            if n < self.a.min_mask_px:
+                continue
+            # 기대 면적과의 로그 비율 (작아도 커도 벌점) — 없으면 점수만 사용
+            pen = abs(np.log(n / expect)) if expect else 0.0
+            cand.append((pen - 0.5 * float(scores[i]), i, n, mm))
+        if not cand:
+            return None, "쓸 만한 마스크 없음 (전부 너무 작음)"
+        cand.sort(key=lambda c: c[0])
+        _, best, npx, m = cand[0]
+        if expect:
+            self.get_logger().info(
+                f"마스크 후보 {[c[2] for c in sorted(cand, key=lambda c: c[1])]}px "
+                f"/ 기대 {int(expect)}px → #{best} 선택")
+        # (깊이 유효 화소만 남기는 처리는 위 후보 평가에서 이미 끝났다)
         self.last_mask = m
         self.get_logger().info(
             f"SAM2 마스크: {int(m.sum())}px, score={scores[best]:.3f}, seed=({pt[0]:.0f},{pt[1]:.0f})"
@@ -307,6 +337,14 @@ class FoundationPoseNode(Node):
         if self.client.sock is None:
             try:
                 self.client.connect()
+                # 서버가 들고 있는 메시의 실제 크기를 받아 /size 로 쓴다.
+                # --diameter 추정값을 쓰면 오버레이 박스가 실물과 어긋난다.
+                rep = self.client.call({"cmd": "ping"})
+                ext = rep.get("extents")
+                if ext:
+                    self.a.abc = sorted((float(x) for x in ext), reverse=True)
+                    self.get_logger().info(
+                        f"메시 크기 수신: {[round(x, 4) for x in self.a.abc]} m")
                 self.get_logger().info(f"fp_server 접속: {self.a.server}")
             except Exception as e:                                # noqa: BLE001
                 self.get_logger().warn(f"fp_server 접속 실패: {e}", throttle_duration_sec=5.0)
@@ -408,9 +446,10 @@ def main():
     ap.add_argument("--min-mask-px", type=int, default=400)
     ap.add_argument("--no-click", dest="click", action="store_false", default=True,
                     help="클릭 선택 창을 끄고 ROI+깊이 자동 시드만 사용")
-    ap.add_argument("--no-auto-reset", dest="auto_reset", action="store_false",
-                    default=True,
-                    help="추적 이탈 시 자동 재등록 끄기 (기본은 켬)")
+    ap.add_argument("--auto-reset", action="store_true", default=False,
+                    help="추적 이탈을 깊이로 추정해 자동 재등록 (기본 꺼짐). "
+                         "휴리스틱이라 오판하면 1~2초마다 재등록을 반복해 오히려 "
+                         "박스가 계속 튄다. 보통은 클릭이나 /reset 으로 충분하다")
     ap.add_argument("--check-tol", type=float, default=0.05,
                     help="자세 z 와 관측 깊이 중앙값의 허용 차 [m]")
     ap.add_argument("--check-win", type=int, default=6,
