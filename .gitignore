@@ -10,3 +10,15 @@ log/
 
 # 서드파티 vendored 클론 (231M, 자체 .git, legacy 전용)
 vendor/
+
+# 수집 데이터 / 모델 가중치 / 별도 저장소 — git 추적만 제외(파일은 그대로 둔다)
+hdf5/                 # 수집 원본 h5 (재생성 불가, 절대 삭제 금지)
+!hdf5/*.py            #   단 그 안의 스크립트는 추적
+record/logs/          # 수집 원본 h5 (동상)
+record/snapshots/     # 실행 산출 PNG
+fruit-manipulation/   # 1.5G, 자체 .git (별도 저장소)
+foundation_pose/      # 모델 가중치 포함
+diffusion_policy/     # 학습 런/체크포인트 포함
+Obj/
+.claude/
+*.log

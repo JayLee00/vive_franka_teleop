@@ -4,6 +4,32 @@ Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-s
 
 **Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
 
+---
+
+## 0. 수집 데이터는 절대 지우지 않는다 (최우선)
+
+`record/logs/` 와 `hdf5/` 는 **사람이 로봇 앞에서 발판을 밟아가며 모은 원본 데이터**다.
+재생성이 불가능하고, 이 저장소의 어떤 코드보다 비싸다.
+
+**금지 — 어떤 이유로도 하지 말 것:**
+- `rm record/logs/*.h5`, `rm -rf record/logs`, `rmdir record/logs`
+- 그 안의 파일을 이동·이름변경·덮어쓰기 (`mv`, `>`, `h5py.File(..., "w")`)
+- "테스트를 깨끗한 상태에서 시작하려고" 비우는 것 ← **실제로 22 데모 9분치를
+  이 이유로 날렸다 (2026-08-05, 다른 세션이 `rm -f record/logs/*.h5` 를 6회 실행).
+  Trash 미경유라 복구도 불가능했다.**
+
+**레코더/파이프라인을 테스트할 때:**
+- 출력은 `/tmp` 또는 `$CLAUDE_JOB_DIR/tmp` 로 보낸다. `--out_dir` 를 쓰거나
+  `OUT_DIR` 를 인자로 받게 고친다. 실데이터 폴더를 픽스처로 쓰지 않는다.
+- 원본을 읽을 때는 반드시 `h5py.File(path, "r")`. 클램프·전처리는 메모리에서만 한다.
+
+**수집 직후 다른 파티션으로 백업한다:**
+```bash
+rsync -a ~/Desktop/vive_franka_teleop/record/logs/ /mnt/grasp_data/lemon_logs_backup/
+```
+
+지우는 게 꼭 필요하다고 판단되면 **먼저 사용자에게 묻는다.** 예외 없다.
+
 ## 1. Think Before Coding
 
 **Don't assume. Don't hide confusion. Surface tradeoffs.**
