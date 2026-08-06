@@ -50,6 +50,7 @@ while [ $# -gt 0 ]; do
     --compare) PUB_NS=/fruit_fp ;;
     --mesh)    MESH="$2"; MESH_EXPLICIT=1; shift ;;
     --fruit)   FRUIT="$2"; shift ;;
+    --seg-hz)  SEGHZ="$2"; shift ;;
     --check)   CHECK=1 ;;
   esac
   shift
@@ -143,7 +144,7 @@ fi
 
 echo "── 4) ROS2 브리지 (호스트, SAM2 초기 마스크) ──"
 /usr/bin/python3 "$HERE/fp_ros_node.py" \
-  --server "127.0.0.1:$PORT" --ns "$PUB_NS" \
+  --server "127.0.0.1:$PORT" --ns "$PUB_NS" --seg-hz "${SEGHZ:-5}" \
   --color-topic "$COLOR_FAST" --depth-topic "$DEPTH" --info-topic "$INFO" \
   >/tmp/fp_node.log 2>&1 &
 PIDS+=($!)

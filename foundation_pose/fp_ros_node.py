@@ -25,6 +25,7 @@ import pickle
 import socket
 import struct
 import sys
+import threading
 import time
 
 import cv2
@@ -118,6 +119,13 @@ class FoundationPoseNode(Node):
         self.sam = None
         self.seeded = False      # 스트림 트래커에 씨앗을 심었는지
         self.registered = False
+        # 세그는 자세 루프와 분리해 돈다 (같이 돌리면 28Hz→14Hz 로 떨어지고
+        # 프레임 간 이동량이 두 배가 되어 회전 정합이 무너진다 — 실측)
+        self._sam_lock = threading.Lock()     # self.sam 은 두 스레드가 만진다
+        self._seg_lock = threading.Lock()
+        self._seg_frame = None                # 세그 스레드에 넘길 최신 (rgb, depth)
+        self._seg_since_seed = 0              # 마지막 시드 이후 추적한 프레임 수
+        self._seg_hz = 0.0
         self.n = 0
         self.n_ok = 0
         self.t_last = time.perf_counter()
@@ -144,6 +152,10 @@ class FoundationPoseNode(Node):
         self.sync = message_filters.ApproximateTimeSynchronizer(
             [sub_c, sub_d], queue_size=5, slop=0.05)
         self.sync.registerCallback(self._on_rgbd)
+
+        self._stop = threading.Event()
+        self._seg_thread = threading.Thread(target=self._seg_loop, daemon=True)
+        self._seg_thread.start()
 
         self.create_timer(2.0, self._status)
 
@@ -316,9 +328,11 @@ class FoundationPoseNode(Node):
 
         # 스트림 트래커를 그 점으로 다시 씨앗 심는다. 이후 프레임은 _track_mask 가
         # 메모리로 이어받으므로 여기서 다시 프롬프트할 일이 없다.
-        self.sam.reset()
-        self.sam.load_first_frame(rgb)
-        raw = self.sam.add_prompt(points=[(float(pt[0]), float(pt[1]))], labels=[1])
+        with self._sam_lock:
+            self.sam.reset()
+            self.sam.load_first_frame(rgb)
+            raw = self.sam.add_prompt(points=[(float(pt[0]), float(pt[1]))], labels=[1])
+        self._seg_since_seed = 0
         self.seeded = True
 
         m = self._trim_by_depth(np.asarray(raw).astype(bool), depth)
@@ -336,25 +350,86 @@ class FoundationPoseNode(Node):
             f"{' [클릭]' if self.click_pt is not None else ''} — 이후 메모리로 추적")
         return m, None
 
-    def _track_mask(self, rgb: np.ndarray, depth: np.ndarray):
-        """씨앗 심은 뒤 매 프레임: 메모리뱅크로 같은 물체를 이어서 세그.
+    def _pose_px(self):
+        """현재 자세를 화면 좌표로 투영 — 재시드 지점으로 쓴다.
 
-        FoundationPose 자세추정에는 첫 프레임 마스크만 필요하지만, 이 마스크가
-        계속 있으면 (1) 화면 오버레이가 부드럽고 (2) 크기를 매 프레임 다시 잴 수
-        있다. 기존 live_bbox_gui.py 와 같은 방식이다.
+        물체가 움직인 뒤에는 처음 클릭한 좌표가 이미 낡았다. FoundationPose 가
+        물체 위치를 알고 있으니 그걸 재시드 지점으로 쓰는 게 정확하다.
         """
-        if not self.seeded:
+        T = self.last_pose
+        if T is None or self.K is None:
             return None
-        try:
-            m = np.asarray(self.sam.track(rgb)).astype(bool)
-        except Exception as e:                                   # noqa: BLE001
-            self.get_logger().warn(f"SAM2 추적 실패: {e}", throttle_duration_sec=5.0)
+        z = float(T[2, 3])
+        if z <= 0:
             return None
-        m = self._trim_by_depth(m, depth)
-        if int(m.sum()) < self.a.min_mask_px:
-            return None
-        self.last_mask = m
-        return m
+        return (self.K[0, 0] * T[0, 3] / z + self.K[0, 2],
+                self.K[1, 1] * T[1, 3] / z + self.K[1, 2])
+
+    def _seg_loop(self):
+        """세그 전용 스레드: 메모리로 추적하되 주기적으로/무너지면 다시 씨앗을 심는다.
+
+        live_bbox_gui.py 의 `reseg_every_n` + in-hand gate 와 같은 발상이다.
+        메모리만으로 오래 끌면 마스크가 물체 일부로 쪼그라들거나 배경으로 샌다
+        (실측: 10600px → 4800px). 주기적으로 다시 프롬프트해 붙잡아 준다.
+        """
+        t0 = time.perf_counter()
+        n = 0
+        t_last = 0.0
+        min_dt = (1.0 / self.a.seg_hz) if self.a.seg_hz > 0 else 0.0
+        while not self._stop.is_set():
+            # 세그는 오버레이·크기용이라 카메라 속도가 필요 없다. 제한을 안 걸면
+            # SAM2 가 GPU 를 계속 물고 있어 FoundationPose 가 28Hz→11Hz 로 떨어지고,
+            # 프레임 간 이동량이 커져 회전이 튄다(실측).
+            now = time.perf_counter()
+            if min_dt and now - t_last < min_dt:
+                time.sleep(0.005)
+                continue
+            with self._seg_lock:
+                fr = self._seg_frame
+                self._seg_frame = None
+            if fr is None or not self.seeded:
+                time.sleep(0.005)
+                continue
+            t_last = now
+            rgb, depth = fr
+
+            need_reseed = (self.a.reseg_every > 0
+                           and self._seg_since_seed >= self.a.reseg_every)
+            try:
+                with self._sam_lock:
+                    if need_reseed:
+                        pt = self._pose_px()
+                        if pt is None:
+                            need_reseed = False
+                        else:
+                            self.sam.reset()
+                            self.sam.load_first_frame(rgb)
+                            m = np.asarray(self.sam.add_prompt(
+                                points=[(float(pt[0]), float(pt[1]))], labels=[1]))
+                            self._seg_since_seed = 0
+                    if not need_reseed:
+                        m = np.asarray(self.sam.track(rgb))
+                        self._seg_since_seed += 1
+            except Exception as e:                               # noqa: BLE001
+                self.get_logger().warn(f"SAM2 세그 실패: {e}", throttle_duration_sec=5.0)
+                time.sleep(0.05)
+                continue
+
+            m = self._trim_by_depth(m.astype(bool), depth)
+            if int(m.sum()) < self.a.min_mask_px:
+                # 마스크가 무너졌다 = 트래커가 물체를 놓쳤다 → 다음 턴에 강제 재시드
+                self._seg_since_seed = self.a.reseg_every
+                self.get_logger().warn(
+                    f"마스크 붕괴 ({int(m.sum())}px) — 자세 위치로 재시드",
+                    throttle_duration_sec=3.0)
+                continue
+            self.last_mask = m
+            if self.a.size_source == "vision":
+                self._update_size(m, depth, quiet=True)
+            n += 1
+            dt = time.perf_counter() - t0
+            if dt >= 2.0:
+                self._seg_hz, n, t0 = n / dt, 0, time.perf_counter()
 
     # ── 물체 교체 / 재등록 ─────────────────────────────────────────────────
     def _on_reset(self, msg: String):
@@ -449,10 +524,11 @@ class FoundationPoseNode(Node):
                 return
             req = {"cmd": "register", "rgb": rgb, "depth": depth, "K": self.K, "mask": mask}
         else:
-            # 씨앗 심은 물체를 메모리로 계속 따라간다 (오버레이·크기 갱신용)
-            m = self._track_mask(rgb, depth)
-            if m is not None and self.a.size_source == "vision":
-                self._update_size(m, depth, quiet=True)
+            # 세그는 별도 스레드가 돈다. 여기서 track() 을 부르면 자세 루프가 그만큼
+            # 느려지고(28Hz→14Hz), 프레임 간 이동량이 두 배가 되어 회전 정합이
+            # 무너진다(실측). 최신 프레임만 넘겨주고 즉시 자세로 넘어간다.
+            with self._seg_lock:
+                self._seg_frame = (rgb, depth)
 
         try:
             rep = self.client.call(req)
@@ -519,7 +595,7 @@ class FoundationPoseNode(Node):
         if self.last_mask is not None and self.last_mask.any():
             ys, xs = np.nonzero(self.last_mask)
             seg = (f"  seg=({xs.mean():.0f},{ys.mean():.0f}) "
-                   f"{int(self.last_mask.sum())}px")
+                   f"{int(self.last_mask.sum())}px @{self._seg_hz:.0f}Hz")
         self.get_logger().info(
             f"{hz:4.1f}Hz  pos=[{t[0]:+.3f},{t[1]:+.3f},{t[2]:+.3f}]m  "
             f"quat=[{q[0]:+.3f},{q[1]:+.3f},{q[2]:+.3f},{q[3]:+.3f}]{seg}")
@@ -540,6 +616,14 @@ def main():
     ap.add_argument("--near-slab", type=float, default=0.05,
                     help="가장 가까운 깊이로부터 이 두께[m] 안쪽만 시드로 사용")
     ap.add_argument("--min-mask-px", type=int, default=400)
+    ap.add_argument("--seg-hz", type=float, default=5.0,
+                    help="세그 스레드 최대 주기 [Hz], 0=제한없음. 마스크는 오버레이와 "
+                         "크기 측정용이라 카메라 속도가 필요 없다. 제한을 풀면 SAM2 가 "
+                         "GPU 를 물고 있어 자세가 28Hz→11Hz 로 떨어진다")
+    ap.add_argument("--reseg-every", dest="reseg_every", type=int, default=30,
+                    help="세그 스레드가 이 프레임 수마다 자세 위치로 재시드 (0=끔). "
+                         "메모리만으로 오래 끌면 마스크가 쪼그라들거나 배경으로 샌다 "
+                         "— live_bbox_gui.py 의 reseg_every_n 과 같은 값")
     ap.add_argument("--size-source", choices=["vision", "cad"], default="vision",
                     help="/fruit/size 를 무엇으로 낼지. vision=마스크+깊이 실측(기본, "
                          "개체마다 크기가 달라서), cad=대표 CAD 공칭치수")
@@ -571,6 +655,8 @@ def main():
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        node._stop.set()
+        node._seg_thread.join(timeout=2.0)
         node.client.close()
         if a.click:
             cv2.destroyAllWindows()
