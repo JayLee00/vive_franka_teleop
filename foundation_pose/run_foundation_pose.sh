@@ -51,6 +51,7 @@ while [ $# -gt 0 ]; do
     --mesh)    MESH="$2"; MESH_EXPLICIT=1; shift ;;
     --fruit)   FRUIT="$2"; shift ;;
     --seg-hz)  SEGHZ="$2"; shift ;;
+    --no-click) NOCLICK="--no-click" ;;
     --check)   CHECK=1 ;;
   esac
   shift
@@ -74,6 +75,26 @@ fi
 [ -f "$MESH" ] || { alt=$(ls "$HERE"/assets/*.obj 2>/dev/null | head -1); [ -n "$alt" ] && MESH="$alt"; }
 
 hz() { timeout 6 ros2 topic hz "$1" 2>/dev/null | grep -oP 'average rate: [\d.]+' | head -1; }
+
+# ── 이전 실행 잔재 정리 ────────────────────────────────────────────────────
+# 이게 없으면 재시작할 때마다 republish 가 하나씩 새고, 같은 컬러 프레임이 N중으로
+# 발행돼 시간동기화가 무너진다. 실측으로 15개까지 쌓여 자세가 30Hz→2.5Hz 로
+# 주저앉은 적이 있다. 남은 노드/컨테이너도 GPU 와 토픽을 물고 있으므로 같이 치운다.
+# pgrep -fc 는 못 찾아도 "0" 을 찍고 exit 1 을 낸다 → `|| echo 0` 을 붙이면 두 줄이
+# 나와 산술식이 깨진다. 첫 줄만 취한다.
+stale() { pgrep -fc "$1" 2>/dev/null | head -1; }
+N_STALE=$(( $(stale "image_transport/republish") + $(stale "fp_ros_node.py") \
+          + $(stale "fruit_label_node.py") ))
+if [ "$N_STALE" -gt 0 ] || docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER"; then
+  echo "── 이전 실행 잔재 정리 ──"
+  pkill -f "image_transport/republish.*color/image_fast" 2>/dev/null
+  pkill -f "foundation_pose/fp_ros_node.py"   2>/dev/null
+  pkill -f "foundation_pose/fruit_label_node.py" 2>/dev/null
+  pkill -f "record/fruit_overlay.py"          2>/dev/null
+  docker rm -f "$CONTAINER" >/dev/null 2>&1
+  sleep 2
+  echo "  정리 완료 (republish $(stale 'image_transport/republish')개 남음)"
+fi
 
 echo "── 0) 준비물 점검 ──"
 MISSING=0
@@ -107,7 +128,13 @@ fi
 PIDS=()
 cleanup() {
   echo ""; echo "정리 중..."
-  for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
+  for p in "${PIDS[@]:-}"; do
+    kill -- "-$p" 2>/dev/null || kill "$p" 2>/dev/null   # 프로세스 그룹째
+  done
+  # `ros2 run` 은 래퍼라 그것만 죽이면 실제 republish 자식이 살아남는다. 그렇게 새어나온
+  # 게 쌓이면 같은 컬러 프레임이 N중으로 발행돼 시간동기화가 무너지고 자세 주기가
+  # 30Hz → 12Hz 로 주저앉는다(실측: 15개 누적, image_fast 51.8Hz).
+  pkill -f "image_transport/republish.*$COLOR_FAST" 2>/dev/null
   docker rm -f "$CONTAINER" >/dev/null 2>&1
   wait 2>/dev/null; echo "종료"
 }
@@ -115,7 +142,9 @@ trap cleanup EXIT INT TERM
 
 echo ""
 echo "── 2) republish (compressed → raw) ──"
-ros2 run image_transport republish compressed raw \
+# 이미 떠 있는 게 있으면 먼저 치운다 — 중복되면 프레임이 겹쳐 동기화가 깨진다
+pkill -f "image_transport/republish.*$COLOR_FAST" 2>/dev/null; sleep 1
+setsid ros2 run image_transport republish compressed raw \
   --ros-args -r "in/compressed:=$COLOR_C" -r "out:=$COLOR_FAST" >/tmp/fp_republish.log 2>&1 &
 PIDS+=($!); sleep 3
 R=$(hz "$COLOR_FAST"); echo "  $COLOR_FAST : ${R:-✗ (로그 /tmp/fp_republish.log)}"
@@ -144,7 +173,7 @@ fi
 
 echo "── 4) ROS2 브리지 (호스트, SAM2 초기 마스크) ──"
 /usr/bin/python3 "$HERE/fp_ros_node.py" \
-  --server "127.0.0.1:$PORT" --ns "$PUB_NS" --seg-hz "${SEGHZ:-5}" \
+  --server "127.0.0.1:$PORT" --ns "$PUB_NS" --seg-hz "${SEGHZ:-5}" ${NOCLICK:-} \
   --color-topic "$COLOR_FAST" --depth-topic "$DEPTH" --info-topic "$INFO" \
   >/tmp/fp_node.log 2>&1 &
 PIDS+=($!)
