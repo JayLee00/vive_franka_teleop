@@ -96,14 +96,78 @@ FoundationPose 는 nvdiffrast 와 PyTorch3D 를 **nvcc 로 소스 빌드**해야
 | `FoundationPose/` | 업스트림 저장소 (클론, git 제외) | — |
 | `weights/`, `assets/` | 가중치·메시 (git 제외) | — |
 
+## 5-2. ROS2 토픽
+
+기존 `/fruit/*` 네임스페이스를 그대로 쓴다. 30~32 는 레코더에 이미 있고, 라벨만 새로 붙었다.
+
+| 토픽 | 타입 | 내용 | 레코더 필드 |
+|---|---|---|---|
+| `/fruit/pose` | PoseStamped | 위치 + 방향 (FoundationPose) | `30_fruit_pos`(3), `31_fruit_quat`(4) |
+| `/fruit/size` | Float32MultiArray[3] | **비전 실측** 축 길이 [m] | `32_fruit_size`(3) |
+| `/fruit/type` | Int32 | 과일 종류 id (레몬=1, 자두=2 …) | `33_fruit_type`(1) ← **추가 필요** |
+| `/fruit/type_name` | String | 표시용 이름 | (기록 안 함) |
+| `/fruit/set_type` | String | **입력** — 종류 전환 | — |
+| `/fruit/reset` | String | **입력** — 재세그/CAD 교체 | — |
+
+`/fruit/type` 은 TRANSIENT_LOCAL 이라 나중에 뜬 레코더도 마지막 라벨을 받는다.
+
+레코더에 넣으려면 `record/ros2_hdf5_recorder.py` 의 필드 표에 한 줄 추가하면 된다
+(원본이라 여기서 건드리지 않았다):
+
+```python
+("33_fruit_type",  "/fruit/type",  Int32, 1, lambda m: [float(m.data)]),
+```
+
+### 크기를 왜 CAD 가 아니라 비전에서 뽑나
+
+CAD 는 **종류당 대표 1개**라 개체 크기를 모른다. 그래서 마스크+깊이를 3D 로 역투영해
+PCA 축 길이를 잰다. 실측 70×55mm 레몬에서 **64.6 × 55.6 mm** 가 나왔다.
+
+두 가지 보정이 들어간다:
+- **배경 깊이 제거** — 마스크가 물체 경계를 넘으면 배경 화소가 섞여 점군이 시선
+  방향으로 늘어난다. 보정 전 826mm 가 나왔다. 물체 깊이 중앙값 ±(크기×1.5) 밖은 자른다.
+- **공칭 대비 3배 검사** — 그래도 이상하면 버리고 CAD 공칭치를 쓴다. 말도 안 되는
+  값이 HDF5 에 들어가는 것보다 낫다.
+
+한계: 카메라는 앞면만 보므로 시선 방향 축은 과소평가된다. 과일은 장축 둘레로 대체로
+회전대칭이라 그 축을 중간축으로 대체해 `(장축, 중간축, 중간축)` 으로 낸다.
+CAD 공칭치를 쓰려면 `--size-source cad`.
+
+## 5-3. 과일 카탈로그
+
+`fruits.yaml` 이 단일 출처다. 종류당 대표 CAD 1개 + 정수 라벨.
+
+```yaml
+- id: 1
+  name: lemon
+  mesh: assets/lemon.obj
+  nominal: [0.070, 0.055, 0.055]
+```
+
+```bash
+python3 foundation_pose/fruit_label_node.py --list   # 카탈로그 + CAD 유무 확인
+```
+
+**새 과일 추가**
+1. 스캔 → `prepare_mesh.py scan.obj -o assets/plum.obj --target-extents 0.055,0.050,0.050`
+2. `fruits.yaml` 에 항목 추가 (id 는 다음 번호)
+
+⚠ **한 번 부여한 id 는 바꾸지 마세요.** HDF5 에 그대로 들어가므로 바꾸면 과거 데이터의
+라벨 의미가 달라집니다.
+
+**전환** (실행 중에 가능, CAD 도 같이 바뀐다)
+```bash
+ros2 topic pub --once /fruit/set_type std_msgs/String '{data: "plum"}'
+```
+
 ## 6. 사용법
 
 ```bash
 # 최초 1회 (도커 이미지 ~20GB 받음)
 bash foundation_pose/setup.sh
 
-# 실행 — 한 줄
-bash foundation_pose/run_foundation_pose.sh
+# 실행 — 한 줄 (과일 지정)
+bash foundation_pose/run_foundation_pose.sh --fruit lemon
 
 # 전제조건만 점검
 bash foundation_pose/run_foundation_pose.sh --check

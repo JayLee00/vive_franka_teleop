@@ -127,6 +127,7 @@ class FoundationPoseNode(Node):
         self.click_pt = None     # 사용자가 찍은 시드 픽셀 (클릭 모드)
         self.last_rgb = None     # GUI 표시용
         self.last_mask = None    # 확인용 마스크 오버레이
+        self.size = None         # 비전으로 실측한 크기 [m] (없으면 CAD 공칭)
         self.win = "FoundationPose select  (클릭=물체선택  r=재선택  q=종료)"
 
         ns = a.ns.rstrip("/")
@@ -220,6 +221,33 @@ class FoundationPoseNode(Node):
         ys, xs = np.nonzero(near)
         return (float(xs.mean()) + x0, float(ys.mean()) + y0)
 
+    def _measure_size(self, mask: np.ndarray, depth: np.ndarray):
+        """마스크+깊이로 실제 과일 크기를 잰다 → /fruit/size.
+
+        CAD 는 종류당 대표 1개뿐이라 개체 크기는 CAD 로 알 수 없다. 그래서 크기는
+        비전으로 잰다.
+
+        한계를 분명히 해두면: 카메라는 **앞면만** 본다. 그래서 점군 PCA 의 세 축 중
+        시선 방향 축(가장 짧게 나오는 축)은 실제의 절반 수준으로 과소평가된다.
+        과일은 장축 둘레로 대체로 회전대칭이므로, 그 축은 중간축으로 대체한다.
+        결과는 (장축, 중간축, 중간축) 이며 앞 두 개는 실측에 가깝다.
+        """
+        vs, us = np.nonzero(mask)
+        z = depth[vs, us]
+        ok = z > 0
+        if ok.sum() < 100:
+            return None
+        vs, us, z = vs[ok], us[ok], z[ok]
+        K = self.K
+        pts = np.stack([(us - K[0, 2]) * z / K[0, 0],
+                        (vs - K[1, 2]) * z / K[1, 1], z], axis=1)
+        c = pts.mean(axis=0)
+        ev = np.linalg.eigh(np.cov((pts - c).T))[1][:, ::-1]      # 고유값 큰 순
+        proj = (pts - c) @ ev
+        ext = np.sort(proj.max(axis=0) - proj.min(axis=0))[::-1]
+        a, b = float(ext[0]), float(ext[1])
+        return [a, b, b]                                          # 세 번째는 회전대칭 가정
+
     def _depth_at(self, depth: np.ndarray, pt, r: int = 5):
         """시드 픽셀 주변의 유효 깊이 중앙값 [m]. 없으면 None."""
         h, w = depth.shape
@@ -231,10 +259,16 @@ class FoundationPoseNode(Node):
         return float(np.median(valid)) if valid.size >= 5 else None
 
     def _make_mask(self, rgb: np.ndarray, depth: np.ndarray):
-        # 사용자가 찍었으면 그 점이 우선 — 자동 시드가 엉뚱한 걸 잡는 경우를 없앤다
-        pt = self.click_pt if self.click_pt is not None else self._seed_point(depth)
-        if pt is None:
-            return None, ("클릭 대기 중" if self.a.click else "ROI/깊이대역 안에 물체 없음")
+        # 클릭 모드에서는 자동 시드로 넘어가지 않는다. 자동 시드가 테이블을 잡으면
+        # 마스크·크기·자세가 전부 엉터리로 발행되므로, 사용자가 고를 때까지 기다린다.
+        if self.a.click:
+            if self.click_pt is None:
+                return None, "클릭 대기 중 — 창에서 과일을 클릭하세요"
+            pt = self.click_pt
+        else:
+            pt = self._seed_point(depth)
+            if pt is None:
+                return None, "ROI/깊이대역 안에 물체 없음"
         if self.sam is None:
             self._load_sam2()
         self.sam.set_image(rgb)
@@ -265,12 +299,44 @@ class FoundationPoseNode(Node):
             return None, "쓸 만한 마스크 없음 (전부 너무 작음)"
         cand.sort(key=lambda c: c[0])
         _, best, npx, m = cand[0]
+
+        # 마스크가 물체 경계를 조금 넘어 배경(테이블·벽)을 물면, 그 화소들의 깊이가
+        # 물체보다 훨씬 멀어 점군이 시선 방향으로 길게 늘어난다(실측에서 0.8m 나옴).
+        # 물체 깊이 중앙값 기준으로 물체 크기의 1.5배 밖은 잘라낸다.
+        dm = depth[m]
+        dm = dm[dm > 0]
+        if dm.size >= 20:
+            med = float(np.median(dm))
+            slab = 1.5 * float(max(self.a.abc))
+            m = m & (np.abs(depth - med) <= slab) & (depth > 0)
+            if int(m.sum()) < self.a.min_mask_px:
+                return None, "깊이로 잘라내니 화소가 부족 (마스크가 물체를 벗어남)"
+            if int(m.sum()) < npx:
+                self.get_logger().info(
+                    f"배경 깊이 제거: {npx} → {int(m.sum())}px "
+                    f"(물체 깊이 {med:.3f}m ±{slab*100:.0f}cm)")
         if expect:
             self.get_logger().info(
                 f"마스크 후보 {[c[2] for c in sorted(cand, key=lambda c: c[1])]}px "
                 f"/ 기대 {int(expect)}px → #{best} 선택")
         # (깊이 유효 화소만 남기는 처리는 위 후보 평가에서 이미 끝났다)
         self.last_mask = m
+        if self.a.size_source == "vision":
+            meas = self._measure_size(m, depth)
+            nom = float(max(self.a.abc))
+            if meas and not (nom / 3.0 <= meas[0] <= nom * 3.0):
+                # 마스크가 물체가 아니라 테이블 같은 걸 잡으면 여기서 걸린다.
+                # 말도 안 되는 값을 /fruit/size 로 내보내면 학습 데이터가 오염된다.
+                self.get_logger().warn(
+                    f"비전 실측 {[round(x*1000, 1) for x in meas]} mm 가 CAD 공칭 "
+                    f"{nom*1000:.0f} mm 와 3배 이상 차이 → 버리고 공칭치 사용 "
+                    f"(마스크가 물체를 벗어났을 가능성)")
+                meas = None
+            if meas:
+                self.size = meas
+                self.get_logger().info(
+                    f"비전 실측 크기: {[round(x*1000, 1) for x in meas]} mm "
+                    f"(CAD 공칭 {[round(x*1000, 1) for x in self.a.abc]} mm)")
         self.get_logger().info(
             f"SAM2 마스크: {int(m.sum())}px, score={scores[best]:.3f}, seed=({pt[0]:.0f},{pt[1]:.0f})"
             f"{' [클릭]' if self.click_pt is not None else ''}")
@@ -290,7 +356,12 @@ class FoundationPoseNode(Node):
                 if not rep.get("ok"):
                     self.get_logger().error(f"메시 교체 실패: {rep.get('err')}")
                     return
-                self.get_logger().info(f"메시 교체됨: {path}")
+                ext = rep.get("extents")
+                if ext:
+                    self.a.abc = sorted((float(x) for x in ext), reverse=True)
+                self.size = None        # 새 물체 → 이전 실측치는 버린다
+                self.get_logger().info(
+                    f"메시 교체됨: {path}  공칭 {[round(x, 4) for x in self.a.abc]} m")
             except Exception as e:                                # noqa: BLE001
                 self.get_logger().error(f"메시 교체 호출 실패: {e}")
                 self.client.close()
@@ -411,7 +482,7 @@ class FoundationPoseNode(Node):
         self.pub_pose.publish(p)
 
         s = Float32MultiArray()
-        s.data = [float(x) for x in self.a.abc]
+        s.data = [float(x) for x in (self.size or self.a.abc)]
         self.pub_size.publish(s)
 
     def _status(self):
@@ -444,6 +515,9 @@ def main():
     ap.add_argument("--near-slab", type=float, default=0.05,
                     help="가장 가까운 깊이로부터 이 두께[m] 안쪽만 시드로 사용")
     ap.add_argument("--min-mask-px", type=int, default=400)
+    ap.add_argument("--size-source", choices=["vision", "cad"], default="vision",
+                    help="/fruit/size 를 무엇으로 낼지. vision=마스크+깊이 실측(기본, "
+                         "개체마다 크기가 달라서), cad=대표 CAD 공칭치수")
     ap.add_argument("--no-click", dest="click", action="store_false", default=True,
                     help="클릭 선택 창을 끄고 ROI+깊이 자동 시드만 사용")
     ap.add_argument("--auto-reset", action="store_true", default=False,

@@ -48,12 +48,28 @@ export DISPLAY="${DISPLAY:-:1}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --compare) PUB_NS=/fruit_fp ;;
-    --mesh)    MESH="$2"; shift ;;
+    --mesh)    MESH="$2"; MESH_EXPLICIT=1; shift ;;
+    --fruit)   FRUIT="$2"; shift ;;
     --check)   CHECK=1 ;;
   esac
   shift
 done
-# assets/ 에 lemon.obj 만 있고 orange.obj 가 없으면 그걸 쓴다
+# --fruit 를 주면 카탈로그에서 그 과일의 CAD 를 쓴다 (--mesh 보다 우선순위 낮음)
+FRUIT="${FRUIT:-lemon}"
+if [ -z "${MESH_EXPLICIT:-}" ] && [ -f "$HERE/fruits.yaml" ]; then
+  m=$(/usr/bin/python3 - "$HERE" "$FRUIT" <<'PY' 2>/dev/null
+import os, sys, yaml
+here, key = sys.argv[1], sys.argv[2]
+for c in yaml.safe_load(open(os.path.join(here, "fruits.yaml")))["fruits"]:
+    if str(c["id"]) == key or c["name"].lower() == key.lower():
+        p = c["mesh"] if os.path.isabs(c["mesh"]) else os.path.join(here, c["mesh"])
+        print(p if os.path.isfile(p) else "")
+        break
+PY
+)
+  [ -n "$m" ] && MESH="$m"
+fi
+# 그래도 없으면 assets/ 의 아무 obj
 [ -f "$MESH" ] || { alt=$(ls "$HERE"/assets/*.obj 2>/dev/null | head -1); [ -n "$alt" ] && MESH="$alt"; }
 
 hz() { timeout 6 ros2 topic hz "$1" 2>/dev/null | grep -oP 'average rate: [\d.]+' | head -1; }
@@ -135,14 +151,20 @@ echo "  기동 중... (SAM2 로드 ~10초, 로그 /tmp/fp_node.log)"
 sleep 15
 grep -E "SAM2 준비|SAM2 마스크|초기 등록|K 수신|접속|실패" /tmp/fp_node.log | tail -5 | sed 's/^/    /'
 
-echo "── 5) fruit_overlay (원본 그대로) ──"
+echo "── 5) 과일 라벨 노드 (/fruit/type) ──"
+/usr/bin/python3 "$HERE/fruit_label_node.py" --fruit "$FRUIT" >/tmp/fp_label.log 2>&1 &
+PIDS+=($!); sleep 3
+grep -E "과일 =|카탈로그|CAD 교체|모르는 과일" /tmp/fp_label.log | tail -3 | sed 's/^/    /'
+
+echo "── 6) fruit_overlay (원본 그대로) ──"
 /usr/bin/python3 "$PROJ/record/fruit_overlay.py" \
   --color-topic "$COLOR_C" --info-topic "$INFO" >/tmp/fp_overlay.log 2>&1 &
 PIDS+=($!); sleep 3
 
 echo ""
 echo "── 상태 ──"
-echo "  $PUB_NS/pose : $(hz "$PUB_NS/pose" || echo '✗ 아직 (과일이 ROI+깊이대역 안에 있어야 함)')"
+echo "  $PUB_NS/pose : $(hz "$PUB_NS/pose" || echo '✗ 아직 (창에서 과일을 클릭하세요)')"
+echo "  /fruit/type  : $(timeout 5 ros2 topic echo /fruit/type --once 2>/dev/null | grep -oP 'data: \K\d+' || echo '✗')"
 echo ""
 echo "창: 'Fruit 6DoF overlay' (q=종료, s=스냅샷)"
 echo "로그: /tmp/fp_node.log (브리지), docker logs $CONTAINER (추정), /tmp/fp_overlay.log"
