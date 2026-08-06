@@ -45,9 +45,16 @@ export ROS_DOMAIN_ID=9 RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_LOCALHOST_ONLY=0
 export FASTRTPS_DEFAULT_PROFILES_FILE="$PROJ/config/fastdds_lan_only.xml"
 export DISPLAY="${DISPLAY:-:1}"
 
-for arg in "$@"; do
-  [ "$arg" = "--compare" ] && PUB_NS=/fruit_fp
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --compare) PUB_NS=/fruit_fp ;;
+    --mesh)    MESH="$2"; shift ;;
+    --check)   CHECK=1 ;;
+  esac
+  shift
 done
+# assets/ 에 lemon.obj 만 있고 orange.obj 가 없으면 그걸 쓴다
+[ -f "$MESH" ] || { alt=$(ls "$HERE"/assets/*.obj 2>/dev/null | head -1); [ -n "$alt" ] && MESH="$alt"; }
 
 hz() { timeout 6 ros2 topic hz "$1" 2>/dev/null | grep -oP 'average rate: [\d.]+' | head -1; }
 
@@ -78,7 +85,7 @@ if [ -z "${C:-}" ] || [ -z "${I:-}" ] || [ -z "${D:-}" ]; then
   echo "  ros2 param set /camera/camera align_depth.enable true"
   exit 1
 fi
-[ "${1:-}" = "--check" ] && { echo "점검만 수행 — 종료"; exit 0; }
+[ "${CHECK:-0}" = 1 ] && { echo "점검만 수행 — 종료"; exit 0; }
 
 PIDS=()
 cleanup() {

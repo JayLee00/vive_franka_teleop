@@ -27,6 +27,7 @@ import struct
 import sys
 import time
 
+import cv2
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
@@ -123,6 +124,10 @@ class FoundationPoseNode(Node):
 
         self.lost = 0            # 연속 추적실패 프레임 수
         self.n_reg = 0           # register 횟수
+        self.click_pt = None     # 사용자가 찍은 시드 픽셀 (클릭 모드)
+        self.last_rgb = None     # GUI 표시용
+        self.last_mask = None    # 확인용 마스크 오버레이
+        self.win = "FoundationPose select  (클릭=물체선택  r=재선택  q=종료)"
 
         ns = a.ns.rstrip("/")
         self.pub_pose = self.create_publisher(PoseStamped, f"{ns}/pose", QOS)
@@ -139,6 +144,44 @@ class FoundationPoseNode(Node):
         self.sync.registerCallback(self._on_rgbd)
 
         self.create_timer(2.0, self._status)
+
+        if a.click:
+            # cv2 GUI 는 메인 스레드에서 돌아야 한다 → 타이머(=spin 스레드)에서 처리
+            cv2.namedWindow(self.win, cv2.WINDOW_NORMAL)
+            cv2.setMouseCallback(self.win, self._on_mouse)
+            self.create_timer(1.0 / 30.0, self._gui)
+            self.get_logger().info("클릭 모드: 창에서 물체를 클릭하면 그 지점으로 SAM2 를 겁니다")
+
+    # ── 클릭 GUI ──────────────────────────────────────────────────────────
+    def _on_mouse(self, event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self.click_pt = (float(x), float(y))
+            self.registered = False        # 새로 고른 물체로 다시 등록
+            self.lost = 0
+            self.get_logger().info(f"클릭 ({x},{y}) — SAM2 재세그멘테이션")
+
+    def _gui(self):
+        if self.last_rgb is None:
+            return
+        img = cv2.cvtColor(self.last_rgb, cv2.COLOR_RGB2BGR).copy()
+        if self.last_mask is not None and self.last_mask.shape == img.shape[:2]:
+            img[self.last_mask] = (0.45 * np.array([0, 255, 0]) +
+                                   0.55 * img[self.last_mask]).astype(np.uint8)
+        if self.click_pt is not None:
+            p = (int(self.click_pt[0]), int(self.click_pt[1]))
+            cv2.drawMarker(img, p, (0, 0, 255), cv2.MARKER_CROSS, 18, 2)
+        msg = ("추적 중 — 다른 물체를 클릭하면 그쪽으로 옮겨갑니다" if self.registered
+               else "물체를 클릭하세요")
+        cv2.putText(img, msg, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (0, 255, 0) if self.registered else (0, 200, 255), 2)
+        cv2.imshow(self.win, img)
+        k = cv2.waitKey(1) & 0xFF
+        if k in (ord("q"), 27):
+            raise KeyboardInterrupt
+        if k == ord("r"):
+            self.click_pt = None
+            self.registered = False
+            self.get_logger().info("재선택 — 자동 시드로 되돌림")
 
     # ── 초기 마스크 (SAM2) ─────────────────────────────────────────────────
     def _load_sam2(self):
@@ -178,9 +221,10 @@ class FoundationPoseNode(Node):
         return (float(xs.mean()) + x0, float(ys.mean()) + y0)
 
     def _make_mask(self, rgb: np.ndarray, depth: np.ndarray):
-        pt = self._seed_point(depth)
+        # 사용자가 찍었으면 그 점이 우선 — 자동 시드가 엉뚱한 걸 잡는 경우를 없앤다
+        pt = self.click_pt if self.click_pt is not None else self._seed_point(depth)
         if pt is None:
-            return None, "ROI/깊이대역 안에 물체 없음"
+            return None, ("클릭 대기 중" if self.a.click else "ROI/깊이대역 안에 물체 없음")
         if self.sam is None:
             self._load_sam2()
         self.sam.set_image(rgb)
@@ -196,8 +240,10 @@ class FoundationPoseNode(Node):
         m &= (depth > self.a.depth_band[0]) & (depth < self.a.depth_band[1])
         if m.sum() < self.a.min_mask_px:
             return None, "깊이 유효 화소 부족"
+        self.last_mask = m
         self.get_logger().info(
-            f"SAM2 마스크: {int(m.sum())}px, score={scores[best]:.3f}, seed=({pt[0]:.0f},{pt[1]:.0f})")
+            f"SAM2 마스크: {int(m.sum())}px, score={scores[best]:.3f}, seed=({pt[0]:.0f},{pt[1]:.0f})"
+            f"{' [클릭]' if self.click_pt is not None else ''}")
         return m, None
 
     # ── 물체 교체 / 재등록 ─────────────────────────────────────────────────
@@ -267,6 +313,7 @@ class FoundationPoseNode(Node):
                 return
 
         rgb = self.bridge.imgmsg_to_cv2(c_msg, "rgb8")
+        self.last_rgb = rgb
         d = self.bridge.imgmsg_to_cv2(d_msg, "passthrough")
         depth = (d.astype(np.float32) / 1000.0) if d.dtype == np.uint16 else d.astype(np.float32)
         depth[(depth < self.a.depth_band[0]) | (depth > self.a.depth_band[1])] = 0.0
@@ -359,6 +406,8 @@ def main():
     ap.add_argument("--near-slab", type=float, default=0.05,
                     help="가장 가까운 깊이로부터 이 두께[m] 안쪽만 시드로 사용")
     ap.add_argument("--min-mask-px", type=int, default=400)
+    ap.add_argument("--no-click", dest="click", action="store_false", default=True,
+                    help="클릭 선택 창을 끄고 ROI+깊이 자동 시드만 사용")
     ap.add_argument("--no-auto-reset", dest="auto_reset", action="store_false",
                     default=True,
                     help="추적 이탈 시 자동 재등록 끄기 (기본은 켬)")
@@ -385,6 +434,8 @@ def main():
         pass
     finally:
         node.client.close()
+        if a.click:
+            cv2.destroyAllWindows()
         node.destroy_node()
 
 

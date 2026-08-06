@@ -139,6 +139,9 @@ def main():
                     help="실측 지름 [m] 으로 강제 스케일 (예: 0.072). 가장 확실하다")
     ap.add_argument("--scale", type=float, default=None,
                     help="배율 직접 지정 (mm→m 이면 0.001). --target-diameter 와 배타")
+    ap.add_argument("--target-extents", default=None,
+                    help="축별 실측 크기 'a,b,c' [m] (긴축부터). 스캔이 실제 비율을 "
+                         "못 잡았을 때 축마다 다른 배율로 맞춘다 (예: 0.070,0.055,0.055)")
     ap.add_argument("--max-faces", type=int, default=50000,
                     help="이보다 많으면 단순화 (0=끔)")
     a = ap.parse_args()
@@ -176,9 +179,26 @@ def main():
         return
 
     # ── 스케일 ────────────────────────────────────────────────────────────
-    if a.target_diameter and a.scale:
-        print("✗ --target-diameter 와 --scale 은 같이 못 씁니다"); sys.exit(1)
-    if a.target_diameter:
+    if sum(x is not None for x in (a.target_diameter, a.scale, a.target_extents)) > 1:
+        print("✗ --target-diameter / --scale / --target-extents 중 하나만 쓰세요")
+        sys.exit(1)
+    if a.target_extents:
+        # 축마다 다른 배율. 메시의 주축(PCA)이 아니라 bounding box 축을 긴 순으로
+        # 정렬해 대응시킨다 — 스캔이 실제 비율을 못 잡았을 때 쓴다.
+        want = np.array(sorted((float(x) for x in a.target_extents.split(",")),
+                               reverse=True))
+        cur = np.asarray(m.extents, dtype=float)
+        order = np.argsort(cur)[::-1]              # 긴 축부터
+        s_vec = np.ones(3)
+        s_vec[order] = want / cur[order]
+        print(f"\n스케일    : 축별 {np.round(cur,4).tolist()} → "
+              f"{np.round(cur*s_vec,4).tolist()} m  (배율 {np.round(s_vec,4).tolist()})")
+        if s_vec.max() / s_vec.min() > 1.15:
+            print("  ⚠ 축별 배율 차가 큽니다 = 스캔 형상이 실물과 다릅니다.")
+            print("    깊이 정합에는 실측을 맞추는 쪽이 유리하지만, 텍스처가 늘어납니다.")
+        m.apply_transform(np.diag([*s_vec, 1.0]))
+        s = 1.0
+    elif a.target_diameter:
         cur = float(np.max(m.extents))
         s = a.target_diameter / cur
         print(f"\n스케일    : 최대축 {cur:.4f} → {a.target_diameter:.4f} m  (×{s:.6g})")
