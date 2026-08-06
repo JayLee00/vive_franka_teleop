@@ -163,6 +163,7 @@ def make_ckpt(policy, ema, opt, sched_lr, epoch, gstep, best_val,
                 "dit_n_layer": args.dit_n_layer, "dropout": args.dropout,
             },
             "train": {"obs_noise": args.obs_noise, "lr": args.lr,
+                      "mod_dropout": args.mod_dropout,
                       "weight_decay": args.weight_decay, "batch": args.batch,
                       "epochs": args.epochs, "ema_decay": args.ema_decay},
         },
@@ -205,6 +206,11 @@ def main():
     ap.add_argument("--obs_noise", type=float, default=0.0,
                     help="정규화된 obs 에 더하는 가우시안 노이즈 sigma (증강)")
     ap.add_argument("--dropout", type=float, default=0.0)
+    ap.add_argument("--mod_dropout", type=float, default=0.0,
+                    help="학습 중 센서군을 통째로 가릴 확률(군마다 독립). "
+                         "hand state 에만 의존하는 것을 막는다")
+    ap.add_argument("--drop_groups", default="",
+                    help="mod_dropout 대상 키 (쉼표). 비우면 전체 군")
     ap.add_argument("--cond_dim", type=int, default=256)
     ap.add_argument("--channels", default="64,128,256")
     ap.add_argument("--dit_d_model", type=int, default=256)
@@ -288,6 +294,12 @@ def main():
         pass  # 아래에서 ETA 만 계산
 
     # ── 모델 ──────────────────────────────────────────────────────────────
+    drop_groups = []
+    if args.mod_dropout > 0:
+        want = [x.strip() for x in args.drop_groups.split(",") if x.strip()]
+        drop_groups = [g for g in C.OBS_GROUPS if not want or g[0] in want]
+        print(f"[AUG] 모달리티 dropout p={args.mod_dropout} 대상: "
+              f"{[g[0] for g in drop_groups]}")
     chans = tuple(int(x) for x in args.channels.split(","))
     mkw = dict(algo=args.algo, cond_dim=args.cond_dim, channels=chans,
                dropout=args.dropout, pred_horizon=args.pred_horizon,
@@ -478,6 +490,13 @@ def main():
                 B = obs.shape[0]
                 if args.obs_noise > 0:      # 증강: 정규화 공간에서 obs 에 노이즈
                     obs = obs + torch.randn_like(obs) * args.obs_noise
+                if drop_groups:
+                    # 센서군 통째 가리기. 정규화 공간의 0 = 학습 평균 = '정보 없음'.
+                    # 손 관절만 보고 액션을 외우는 걸 막고 다른 센서를 쓰게 강제한다.
+                    m = (torch.rand(B, len(drop_groups), device=obs.device)
+                         < args.mod_dropout)
+                    for gi, (_n, a, b) in enumerate(drop_groups):
+                        obs[:, :, a:b] = obs[:, :, a:b] * (~m[:, gi]).float()[:, None, None]
                 loss = policy.compute_loss(obs, act, sched, args.diff_steps)
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"epoch {epoch}: loss={loss.item()}")

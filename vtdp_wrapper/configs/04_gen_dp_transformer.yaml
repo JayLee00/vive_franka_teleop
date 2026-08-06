@@ -1,0 +1,8 @@
+# ══ 04 · [축3 생성기] DP-CNN → DP-Transformer ═════════════════════════════
+# 액션 토큰이 관측 토큰을 cross-attention 으로 본다(pooled 로 안 뭉갠다).
+# 모달리티가 늘수록 pooled 대비 이점이 커지는 구조.
+_base_: 01_anchor.yaml
+
+model:
+  denoiser: transformer
+  denoiser_kwargs: {n_layer: 4, n_head: 4}

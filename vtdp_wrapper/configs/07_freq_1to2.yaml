@@ -1,0 +1,24 @@
+# ══ 07 · [축4 주파수] rgb:tactile = 1:2 ═══════════════════════════════════
+# lookback 60ms 고정, 촉각만 2배로 촘촘히. rgb 16.7Hz / tactile 33.3Hz.
+#   rgb     stride 6, horizon 2 → offsets [-6, 0]
+#   tactile stride 3, horizon 3 → offsets [-6, -3, 0]
+_base_: 01_anchor.yaml
+
+obs_spec:
+  state:   {kind: state,   keys: ["03_hand_j_pos", "06_hand_j_kin", "30_fruit_pos", "32_fruit_size"], shape: 34, horizon: 2, stride: 6, encoder: mlp}
+  tactile:
+    kind: tactile
+    keys: ["20_paxini_ft"]
+    shape: 12
+    horizon: 3
+    stride: 3
+    encoder: lstm
+    encoder_kwargs: {n_part: 4, return_seq: true}     # 4손가락 x 3스텝 = 12토큰
+  rgb:
+    kind: vision
+    keys: ["40_rgb_jpeg"]
+    shape: [3, 224, 224]
+    horizon: 2
+    stride: 6
+    encoder: resnet18
+    encoder_kwargs: {pretrained: true, frozen: false, norm: auto, tokens: pool, num_kp: 32}

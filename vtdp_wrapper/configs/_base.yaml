@@ -1,0 +1,103 @@
+# ══ 공통 기준(anchor) ═══════════════════════════════════════════════════════
+# 실험 10개는 여기서 **한 번에 한 축만** 바꾼다. 홀드아웃이 3 데모뿐이라
+# 두 개를 동시에 바꾸면 차이의 원인을 짚을 수 없다.
+#
+# 축 4개:
+#   1) rgb            resnet18 | dinov2
+#   2) tactile        lstm | transformer   (+ conv1d)
+#   3) action 생성기   unet1d(DP-CNN) | transformer(DP-Transformer) | dit | flow
+#   4) 주파수 비율      rgb:tactile = 1:1 | 1:2 | 1:3
+#
+# ── 샘플링 격자 ────────────────────────────────────────────────────────────
+# 원본 100Hz. stride 는 모달리티마다 따로 준다(이게 주파수 비율 축이다).
+#   rgb     stride 6 → 16.7Hz.  카메라가 ~30Hz 라 20Hz 로 뽑으면 같은 JPEG 이
+#                      연속 스텝에 중복으로 들어온다. 6이 물리적으로 더 정직하다.
+#   action  stride 5 → 20Hz.  refer/ 에서 검증된 제어 주기라 건드리지 않는다.
+#           (관측 격자와 액션 격자는 독립이다 — 윈도우 시작점에서 뒤/앞으로 따로 샘플)
+#
+# lookback = (horizon-1) x stride 는 **모든 모달리티가 같아야 한다**(60ms).
+# 같지 않으면 주파수가 아니라 히스토리 길이를 바꾼 것이고, refer/ 스윕에서
+# 히스토리 확장(T_obs 4/8/16)은 전부 5~6% 나빴다.
+
+obs_spec:
+  state:
+    kind: state
+    keys: ["03_hand_j_pos", "06_hand_j_kin", "30_fruit_pos", "32_fruit_size"]
+    shape: 34                # hand_j_pos(16)+kin(12)+fruit_pos(3)+fruit_size(3)
+    horizon: 2
+    stride: 6
+    encoder: mlp
+  tactile:
+    kind: tactile
+    keys: ["20_paxini_ft"]
+    shape: 12                # 20_paxini_ft (4손가락 x 3축)
+    horizon: 2
+    stride: 6                # 1:1 — 16.7Hz
+    encoder: lstm
+    encoder_kwargs:
+      n_part: 4              # ★ 손가락 4개를 따로 본다. 부위 임베딩으로 identity 를 남긴다.
+                             #   레이아웃 가정: x[p*3 + c] = 손가락 p 의 축 c (부위-major).
+                             #   실제가 N x 6 이면 n_part = shape/6 으로 고치고 shape 도 맞출 것.
+                             #   inspect_h5.py 로 먼저 확인 — 틀리면 조용히 엉뚱한 손가락을 배운다.
+      return_seq: true       # ★ 시간축 유지. false 면 T 를 1토큰으로 뭉갠다.
+  rgb:
+    kind: vision
+    keys: ["40_rgb_jpeg"]         # 41_rgb_index 로 스텝→프레임을 푼다
+    shape: [3, 224, 224]
+    horizon: 2
+    stride: 6
+    encoder: resnet18
+    encoder_kwargs:
+      pretrained: true
+      frozen: false          # 파인튜닝. backbone LR 은 train.lr_backbone_scale 로 낮춘다.
+                             # frozen: true 로 돌리면 norm=auto 가 BN(eval 고정) 을 고른다 —
+                             # GN 치환은 파인튜닝용이라 얼린 backbone 에 쓰면 feature 가 죽는다.
+      norm: auto             # auto = 파인튜닝이면 gn, frozen 이면 bn
+      tokens: pool           # spatial softmax → 프레임당 토큰 1개
+      num_kp: 32
+
+action:
+  key: 04_hand_j_tar         # 절대 관절 타겟 [count], 1 count = pi/8192 rad
+  dim: 16
+  pred_horizon: 16           # 0.8s @20Hz
+  exec_horizon: 8            # ⚠️ 실기로 재조정. RESULTS.md 는 E=16 이 동작했다고 기록
+  stride: 5                  # 20Hz — refer/ 와 동일
+
+model:
+  d_model: 256
+  cond_dim: 256
+  fusion: concat
+  fusion_kwargs: {}
+  denoiser: unet1d           # DP-CNN
+  denoiser_kwargs:
+    channels: [64, 128, 256]
+  head: diffusion
+  head_kwargs:
+    diff_steps: 100          # cosine DDPM 학습
+    infer_steps: 10          # DDIM 추론
+  modality_dropout: 0.0
+
+data:
+  root: /home/js/Desktop/vive_franka_teleop/record/logs   # ← 연구실 경로. --data 로 덮어쓸 수 있다
+  clamp_spec: null           # null = 폴더의 모든 데모 사용. refer/dp_config.CLAMP_SPEC 형식도 가능
+  keep_dead: false           # 정지 데모(act_std<5) 제외
+  cache_rgb: false           # true 면 디코드된 프레임을 RAM 에 캐시(빠르지만 메모리 많이 씀)
+  ds_stride: 5               # stride 를 명시 안 한 항목의 기본값
+  seed: 42
+  n_held_out: 3
+
+train:
+  epochs: 300
+  batch_size: 64
+  lr: 3.0e-4                 # BASELINES.md 1위
+  lr_backbone_scale: 0.1     # 사전학습 backbone(resnet/dinov2) 은 3e-5. head 와 같은 LR 로
+                             # 밀면 첫 수백 스텝에 사전학습 feature 가 지워진다.
+                             # LoRA 파라미터는 새로 초기화된 것이라 이 그룹에 안 들어간다.
+  weight_decay: 1.0e-6
+  warmup_steps: 500
+  use_ema: true
+  ema_max_decay: 0.9999
+  eval_every: 5              # 홀드아웃 MAE 측정 간격. 매 에폭 재면 eval 이 시간의 56% (실측)
+  eval_n: 768                # 측정에 쓸 홀드아웃 윈도우 수 (균등 추출, 고정). refer/ 와 동일
+  eval_seed: 7               # 샘플링 노이즈 고정 — 안 하면 운 좋은 에폭이 best 로 뽑힌다
+  # ⚠️ dropout·wd·obs 노이즈는 BASELINES.md 실측에서 전부 역효과였다. 켜기 전에 재측정.

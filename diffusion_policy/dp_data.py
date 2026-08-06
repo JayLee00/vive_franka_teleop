@@ -36,10 +36,15 @@ DEAD_ACTION_STD = 5.0     # 관절별 action std 최대가 이 미만이면 '정
 # ══════════════════════════════════════════════════════════════════════════
 # 위생 처리
 # ══════════════════════════════════════════════════════════════════════════
-def sanitize_fruit(pos: np.ndarray, size: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
-    """과일 오검출 프레임을 직전 유효값으로 홀드. 반환: (pos, size, 고친 프레임 수)."""
+def sanitize_fruit(pos: np.ndarray, size: np.ndarray, quat: np.ndarray = None):
+    """과일 오검출 프레임을 직전 유효값으로 홀드.
+
+    위치가 못 믿을 프레임이면 같은 프레임의 방향도 못 믿는다 → quat 도 같이 홀드한다.
+    반환: (pos, size, quat, 고친 프레임 수).  quat 가 None 이면 None 을 그대로 돌려준다.
+    """
     pos = pos.copy()
     size = size.copy()
+    quat = None if quat is None else quat.copy()
     n = len(pos)
     bad = np.zeros(n, dtype=bool)
 
@@ -63,13 +68,15 @@ def sanitize_fruit(pos: np.ndarray, size: np.ndarray) -> tuple[np.ndarray, np.nd
     if fixed:
         good = np.flatnonzero(~bad)
         if len(good) == 0:
-            return pos, size, fixed                        # 전부 불량 → 그대로
+            return pos, size, quat, fixed                  # 전부 불량 → 그대로
         for i in np.flatnonzero(bad):
             prev = good[good < i]
             src = prev[-1] if len(prev) else good[0]
             pos[i] = pos[src]
             size[i] = size[src]
-    return pos, size, fixed
+            if quat is not None:
+                quat[i] = quat[src]
+    return pos, size, quat, fixed
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -146,7 +153,12 @@ def load_demos(data_root: str = DATA_ROOT,
                     parts.append(a)
                 pos_i = OBS_KEYS.index("30_fruit_pos")
                 size_i = OBS_KEYS.index("32_fruit_size")
-                parts[pos_i], parts[size_i], fixed = sanitize_fruit(parts[pos_i], parts[size_i])
+                q_i = OBS_KEYS.index("31_fruit_quat") if "31_fruit_quat" in OBS_KEYS else None
+                parts[pos_i], parts[size_i], _q, fixed = sanitize_fruit(
+                    parts[pos_i], parts[size_i],
+                    parts[q_i] if q_i is not None else None)
+                if q_i is not None:
+                    parts[q_i] = _q
 
                 obs = np.concatenate(parts, axis=1)
                 assert obs.shape == (n_use, OBS_DIM), obs.shape

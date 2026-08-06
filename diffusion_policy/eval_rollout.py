@@ -47,7 +47,7 @@ def load_ckpt(path, device, use_ema=True):
 @torch.no_grad()
 def rollout_demo(policy, sched, obs_norm, act_norm, demo, cfg,
                  device, action_steps, infer_steps, temporal_ensemble=False,
-                 te_k=0.6, seed=0):
+                 te_k=0.6, seed=0, zero_slices=None):
     """반환: (pred (M,16), gt (M,16), t_idx (M,), step_err (T_exec,))"""
     T_obs, T_pred = cfg["obs_horizon"], cfg["pred_horizon"]
     stride = cfg["ds_stride"]
@@ -66,8 +66,12 @@ def rollout_demo(policy, sched, obs_norm, act_norm, demo, cfg,
 
     t = back
     while t + (T_pred - 1) * stride <= N - 1:
-        obs = demo.obs[t + obs_off]                                # (T_obs,46)
-        obs_n = torch.from_numpy(obs_norm.normalize(obs).astype(np.float32))
+        obs = demo.obs[t + obs_off]                            # (T_obs, obs_dim)
+        obs_n = obs_norm.normalize(obs).astype(np.float32)
+        if zero_slices:            # 정규화 공간에서 0 = 학습 평균 = '정보 없음'
+            for a, b in zero_slices:
+                obs_n[:, a:b] = 0.0
+        obs_n = torch.from_numpy(obs_n)
         a_n = policy.sample(obs_n.unsqueeze(0).to(device), sched, T_pred,
                             infer_steps, generator=g)
         a = act_norm.denormalize(a_n.squeeze(0).cpu().numpy())     # (T_pred,16)

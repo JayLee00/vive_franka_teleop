@@ -1,0 +1,35 @@
+# ══ 02 · [축1 rgb] resnet18 파인튜닝 → DINOv2 + LoRA ══════════════════════
+# ViT-S/14. base 는 얼리고 attention 의 qkv/proj 에만 저랭크 보정을 학습한다
+# (21M 전체 파인튜닝은 22 데모에 위험, 완전 frozen 은 손·레몬 클로즈업 도메인에
+#  적응할 여지가 없다 — LoRA 가 그 중간).
+# 224 = 14x16 이라 패치 256개, CLS 토큰만 뽑아 프레임당 1토큰.
+# ⚠️ 첫 실행에 가중치 다운로드(인터넷). 오프라인이면 ~/.cache/torch/hub 를 미리 채울 것.
+_base_: 01_anchor.yaml
+
+obs_spec:
+  state:   {kind: state,   keys: ["03_hand_j_pos", "06_hand_j_kin", "30_fruit_pos", "32_fruit_size"], shape: 34, horizon: 2, stride: 6, encoder: mlp}
+  tactile:
+    kind: tactile
+    keys: ["20_paxini_ft"]
+    shape: 12
+    horizon: 2
+    stride: 6
+    encoder: lstm
+    encoder_kwargs: {n_part: 4, return_seq: true}
+  rgb:
+    kind: vision
+    keys: ["40_rgb_jpeg"]
+    shape: [3, 224, 224]
+    horizon: 2
+    stride: 6
+    encoder: dinov2
+    encoder_kwargs:
+      variant: vits14
+      frozen: true           # LoRA 는 frozen base 를 전제로 한다
+      tokens: cls
+      lora_rank: 8
+      lora_alpha: 16
+      lora_targets: ["qkv", "proj"]
+      grad_ckpt: true        # ⚠️ LoRA 를 켜면 backbone 활성값을 전부 들고 있어야 한다
+                             # (frozen+no_grad 일 때는 0 이던 비용). batch 64 x 프레임 2 =
+                             # ViT forward 128회라 이게 없으면 16GB 카드에서 OOM 난다.
