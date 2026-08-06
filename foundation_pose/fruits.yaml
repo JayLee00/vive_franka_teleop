@@ -26,7 +26,7 @@ fruits:
     name: plum
     name_ko: 자두
     mesh: assets/plum.obj
-    nominal: [0.055, 0.050, 0.050]
+    nominal: [0.063, 0.060, 0.060]   # 실측 대표값 (개체차 있음)
 
   # 아래는 CAD 를 아직 안 뜬 것들 — 스캔하고 mesh 경로만 채우면 바로 쓸 수 있다.
   - id: 3
