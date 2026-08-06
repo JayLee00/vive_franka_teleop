@@ -92,7 +92,12 @@ FoundationPose 는 nvdiffrast 와 PyTorch3D 를 **nvcc 로 소스 빌드**해야
 | `run_foundation_pose.sh` | **원커맨드 런처** | 호스트 |
 | `fp_server.py` | FoundationPose TCP 추론 서버 | 컨테이너 |
 | `fp_ros_node.py` | ROS2 브리지 + SAM2 초기 마스크 | 호스트 |
+| `fruit_label_node.py` | 과일 종류 라벨 발행 + CAD 교체 | 호스트 |
+| `prepare_mesh.py` | 스캔 메시 진단·단위보정·변환 | 호스트 |
 | `make_fruit_mesh.py` | 과일 근사 메시(OBJ+텍스처) 생성 | 호스트 |
+| `capture_scene.py` | RGB-D 를 레포 demo_data 형식으로 녹화 | 호스트 |
+| `test_symmetry_snap.py` | 대칭 스냅·부호 연속성 검증 (카메라 불필요) | 호스트 |
+| `fruits.yaml` | 과일 카탈로그 (id·이름·CAD·공칭크기) | — |
 | `FoundationPose/` | 업스트림 저장소 (클론, git 제외) | — |
 | `weights/`, `assets/` | 가중치·메시 (git 제외) | — |
 
@@ -160,24 +165,68 @@ python3 foundation_pose/fruit_label_node.py --list   # 카탈로그 + CAD 유무
 ros2 topic pub --once /fruit/set_type std_msgs/String '{data: "plum"}'
 ```
 
+전환하면 이 순서로 자동 진행된다:
+
+```
+/fruit/set_type "orange"
+  → fruit_label_node 가 fruits.yaml 조회
+  → /fruit/type = 3 발행
+  → /fruit/reset 에 assets/orange.obj 경로 발행
+  → fp_ros_node → 서버 set_mesh → reset_object() → 재등록
+```
+
+⚠ **CAD 가 없으면 라벨만 바뀌고 자세는 이전 메시로 계속 돈다.** 이러면 HDF5 에
+"자두"라고 적힌 채 레몬 CAD 로 뽑은 자세가 들어간다. 로그에 경고가 뜬다:
+
+```
+CAD 파일이 없습니다: .../assets/plum.obj — 라벨만 발행하고 자세는 이전 메시 유지
+```
+
+수집 전에 `fruit_label_node.py --list` 로 쓸 과일의 CAD 가 ✓ 인지 확인하세요.
+
+또 물체를 **실제로 바꿔 놓은 경우**엔 전환 후 창에서 한 번 클릭해 주는 게 안전하다.
+자동 재등록은 직전 자세 위치를 시드로 쓰므로, 새 과일을 다른 자리에 놓았으면
+엉뚱한 곳을 잡을 수 있다.
+
 ## 6. 사용법
 
 ```bash
 # 최초 1회 (도커 이미지 ~20GB 받음)
 bash foundation_pose/setup.sh
 
-# 실행 — 한 줄 (과일 지정)
+# 실행 — 이 한 줄이면 끝
 bash foundation_pose/run_foundation_pose.sh --fruit lemon
+```
 
-# 전제조건만 점검
-bash foundation_pose/run_foundation_pose.sh --check
+창이 두 개 뜬다. **`FoundationPose select` 에서 과일을 클릭**하면 등록되고,
+`Fruit 6DoF overlay` 에 3D 박스가 붙는다. 종료는 Ctrl+C (컨테이너·republish 까지 정리).
 
-# 기존 방식과 동시 비교 (/fruit_fp/* 로 발행)
-bash foundation_pose/run_foundation_pose.sh --compare
+기본값: 클릭 선택 켬 · 연속 세그 5Hz · 자동 재등록 켬 · 대칭 스냅 켬 ·
+시작 시 이전 잔재 자동 정리.
+
+```bash
+--seg-hz 0 --no-click   # 자세 주기 최대 (연속 세그·클릭 없이 자동 ROI 시드)
+--seg-hz 15             # 세그 더 자주 (자세 주기는 내려감)
+--fruit orange          # 다른 과일
+--check                 # 전제조건만 점검
+--compare               # /fruit_fp/* 로 발행해 기존 파이프라인과 동시 비교
 ```
 
 기본 모드는 `/fruit/pose` · `/fruit/size` 로 발행하는 **드롭인**이라
 `record/fruit_overlay.py` 를 원본 그대로 재사용한다.
+
+### 성능 (RTX 4080 SUPER, 레몬 70×55×55, 카메라 30Hz)
+
+| | |
+|---|---|
+| `/fruit/pose` | **27.2 Hz** (클릭 + 연속 세그 5Hz) |
+| FoundationPose 추론 | 15~22 ms (`track_one`) |
+| 최초 등록 | ~1.5~1.9 s (회전 후보 252개) |
+| TCP 전송·직렬화 | 1~6 ms |
+| 위치 안정도 | 정지 시 ±1 mm |
+
+세그는 자세추정에 **안 쓰인다**(`track_one` 에 마스크 인자가 없다). 오버레이와
+크기 측정용이므로, 자세가 최우선이면 `--seg-hz 0` 이 가장 빠르고 정확하다.
 
 메시 크기를 실측에 맞추려면:
 
@@ -185,15 +234,28 @@ bash foundation_pose/run_foundation_pose.sh --compare
 python3 foundation_pose/make_fruit_mesh.py --diameter 0.075 -o foundation_pose/assets/orange.obj
 ```
 
-## 7. 실측 결과 (2026-08-06, 오렌지 1개, RTX 4080 SUPER)
+## 7. 실측 결과 — CAD 가 전부다
 
-카메라 앞 오렌지 1개로 90초 연속 측정. 근사 구 메시(지름 70mm, 비대칭 텍스처), model-based.
+같은 코드로 두 과일을 재보면 **CAD 품질이 성능을 가른다**는 게 분명하다.
+
+| | 오렌지 (생성한 구 + 가짜 텍스처) | **레몬 (실제 스캔 + 4096² 텍스처)** |
+|---|---|---|
+| 초기 수렴 | ~26초 방황 | **1회 등록에 바로 락** |
+| 회전 | 임의값에 수렴 (절대값 무의미) | **안정, 움직여도 추종** |
+| 위치 | ±1 mm | ±1 mm |
+
+오렌지는 매끈한 구라 회전이 기하학적으로 관측 불가능하고, 텍스처마저 제가 만든
+가짜라 RGB 정합이 단서를 못 준다. 레몬은 (1) 길쭉해서 장축이 형상만으로 관측되고
+(2) 진짜 표면 텍스처가 있어 즉시 잡힌다.
+
+**→ 새 과일을 추가할 땐 반드시 실물을 스캔하세요.** 근사 구 메시는 위치 전용이다.
+
+오렌지 90초 측정 원본:
 
 | 항목 | 결과 |
 |---|---|
-| 발행 주기 | **6~12 Hz** |
 | 위치 | **[+0.023, −0.059, +0.334] m — 90초간 변동 ≤1mm** |
-| 회전 | 초기 ~26초 요동 → **이후 수렴·고정** |
+| 회전 | 초기 ~26초 요동 → 이후 수렴·고정 |
 
 회전 quaternion 변화:
 
@@ -219,6 +281,33 @@ t+26 ~ t+43s   [+0.957,-0.123,+0.262,+0.026]   ← 여기서 락
 - 실측 지름을 맞춘 메시 (`--diameter`) — 지금은 70mm 가정
 - 그 오렌지 사진으로 텍스처를 갈아끼우면 초기 수렴이 빨라진다
 - 회전이 정말 중요하면 model-free(참조영상 16장 + NeRF) 경로
+
+## 7-2. 자세가 이상할 때
+
+**축이 갑자기 휙 바뀐다** — 레몬은 장축 둘레로 거의 회전대칭이라 여러 회전이 관측상
+동등하다. `register()` 는 회전 후보 252개를 직전 자세와 무관하게 새로 뿌리므로,
+재등록하면 동등하지만 다른 대표값이 나온다. 그래서 재등록 직후 **직전 자세에 가장
+가까운 대칭 동등물로 스냅**한다(매 프레임이 아니다 — 그러면 진짜 spin 도 지워진다).
+쿼터니언 부호(`q` vs `-q`)도 직전 값에 맞춘다. 검증: `test_symmetry_snap.py`.
+
+그래도 spin 이 못 쓸 수준이면 `symmetry_tfs` 를 선언해 후보 자체를 합칠 수 있다
+(`estimater.py:120`). 대신 장축 둘레 회전 정보를 버리게 된다.
+
+**주기가 갑자기 떨어졌다** — 십중팔구 `republish` 가 새서 쌓인 것이다. `ros2 run` 은
+래퍼라 그것만 죽으면 자식 `republish` 가 남는다. 15개까지 쌓여 같은 컬러 프레임이
+15중으로 발행되고 시간동기화가 무너져 자세가 30Hz→2.5Hz 로 떨어진 적이 있다.
+
+```bash
+pgrep -fc "image_transport/republish"      # 1 이어야 정상
+ros2 topic hz /camera/camera/color/image_fast   # 카메라(30Hz)보다 높으면 중복
+```
+
+런처가 시작 시 정리하지만, 수동으로 띄웠다면 `pkill -f image_transport/republish`.
+
+**자세가 발산해서 안 돌아온다** — 자동 재등록(`--auto-reset`, 기본 켬)이 잡아준다.
+껐다면 놓친 순간 영원히 못 돌아온다(실측: z 0.31→0.11m). 반대로 이 판정이 너무
+빡빡하면 1~2초마다 재등록해 오히려 자세가 망가지므로, `--check-tol` 은 발산
+감지용으로 넉넉히(기본 0.15m) 잡혀 있다.
 
 ## 8. 전제조건
 
