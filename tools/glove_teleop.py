@@ -41,7 +41,7 @@ from std_msgs.msg import Bool, Float32MultiArray, Int32
 
 # ── 1. 연결 ────────────────────────────────────────────────────────────────
 PORT = "auto"                  # "auto"=CH340 자동 탐지(포트 바뀌어도 OK). 고정하려면 "/dev/ttyUSB0"
-BAUD = 115200
+BAUD = 500000                  # ★ 글러브 펌웨어 Serial.begin() 과 반드시 일치 (현재 500000)
 SIDE = "right"                 # "right"(=핸드0) | "left"(=핸드1)
                                # (발행 주기 설정 없음: 글러브에서 프레임이 오는 즉시 발행 = 장치 최대 속도 ~108Hz)
 
@@ -429,16 +429,35 @@ class GloveTeleop(Node):
             self.get_logger().warn(f"글러브 수신 없음 — {self.port} 확인")
             return
         tag = "DRY" if self.dry_run else "RUN"
-        g = " ".join(f"{v:6.0f}" for v in self.g_last[:8])
         if self.hand_q is None:
+            g = " ".join(f"{v:6.0f}" for v in self.g_last[:8])
             self.get_logger().warn(
                 f"[{tag}] glove[0:8] {g} | /hand/{self.side}/joint_states 대기 중 "
                 "(shm + nd 떠 있는지 확인)")
             return
-        if self.last_target is None:
-            return
-        t = " ".join(f"{v:6.0f}" for v in self.last_target[:8])
-        self.get_logger().info(f"[{tag}] glove[0:8] {g}\n        target[0:8] {t}")
+        # 16관절 전체를 손가락별 4줄로. 각 칸은 "글러브 raw→핸드 타겟" [count].
+        # 글러브 채널은 JOINTS 표에서 끌어온다(관절을 다른 채널에 묶어도 맞게 나온다).
+        # 발판 disengage 면 타겟이 아직 없다 — 그때도 글러브 raw 는 보여준다.
+        # "!" = HAND_LIMITS 에 걸려 잘린 관절. 글러브가 움직여도 타겟이 한계값에
+        #       고정되므로, raw 는 살아있는데 타겟만 안 바뀌는 상황을 여기서 바로 잡는다.
+        src = {hand_idx: (ch, scale, offset, on)
+               for hand_idx, _n, ch, scale, offset, on in JOINTS}
+        rows = []
+        for label, base in (("thumb", 0), ("index", 4), ("middle", 8), ("ring", 12)):
+            cells = []
+            for i in range(base, base + 4):
+                ch, scale, offset, on = src[i]
+                g = self.g_last[ch]
+                pre = g * scale + offset if on else offset      # 클램프 전 값
+                hit = "!" if clamp(i, pre) != pre else " "
+                tgt = f"{self.last_target[i]:<6.0f}" if self.last_target else "  --  "
+                cells.append(f"{g:>6.0f}→{tgt}{hit}")
+            rows.append(f"  {label:<7}" + " ".join(cells))
+        state = "engage" if self.engaged else "DISENGAGE(발판 대기, 타겟 홀드)"
+        self.get_logger().info(
+            f"[{tag}] {state}  glove→target [count] (1 count = pi/8192 rad, 4096=90°)  "
+            "엄지=(cmc_opp,cmc_abd,mcp,ip) 나머지=(abd,flex,pip,dip)  !=클램프\n"
+            + "\n".join(rows))
 
     def shutdown(self):
         self._stop.set()                      # 읽기 스레드 정지
