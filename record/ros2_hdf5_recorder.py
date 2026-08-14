@@ -17,6 +17,7 @@ h5 의 Demo_N/40_image[step] 이 그 스텝에 보이던 파일 번호다(-1 = �
   S(rising edge)  -> 새 Demo_N 버퍼 시작
   E(falling edge) -> 버퍼를 Demo_N 그룹으로 저장, demo_idx += 1
   k 키            -> 현재 파일 저장하고 다음 에피소드부터 Demo_0 새 파일 (배치 분리용)
+  x 키            -> 수집 중인 Demo_N 을 버리고 같은 번호로 처음부터 다시 수집 (실수한 데모 재촬영)
   Ctrl+C          -> 파일 닫고 종료 (저장된 데모는 유지)
 
 배치(nominal / 낙하회복 등)를 다른 파일로 나눠 담고 싶을 때 프로세스를 재시작하지 않고
@@ -156,6 +157,7 @@ class Recorder(Node):
         self.out_path = None                      # 파일은 첫 에피소드 시작 때 생성
         self.img_root = None                      # <h5 stem>_image/ (JPEG 저장 폴더)
         self.roll_req = False                     # k 키 → 파일 롤오버 요청 (키 스레드가 세팅)
+        self.redo_req = False                     # x 키 → 진행 중 데모 폐기 후 같은 번호로 재시작
         self.create_subscription(Bool, "/record/enable", self._on_enable, 10)
 
         # 과일 종류 이름("lemon" 등)은 문자열이라 float 데이터셋에 못 넣는다 → Demo_N attrs 로.
@@ -188,6 +190,7 @@ class Recorder(Node):
             self.get_logger().info(
                 f"레코더 준비. 발판 중간(=/record/enable)으로 시작/종료.\n"
                 f"    k = 현재 파일 저장하고 다음 에피소드부터 Demo_0 새 파일\n"
+                f"    x = 수집 중인 데모 버리고 같은 번호로 다시 수집\n"
                 f"    저장 폴더: {OUT_DIR}")
 
     def _on_msg(self, fields, msg):
@@ -298,6 +301,9 @@ class Recorder(Node):
 
     def _service_keys(self):
         """키 스레드가 올린 요청 처리 (h5 접근을 이 스레드로 모아 경쟁 방지)."""
+        if self.redo_req:
+            self.redo_req = False
+            self._redo_demo()
         if not self.roll_req:
             return
         self.roll_req = False
@@ -311,17 +317,35 @@ class Recorder(Node):
         self.demo_idx = 0
         self.get_logger().info("▶ 롤오버 완료. 다음 에피소드부터 Demo_0")
 
+    def _redo_demo(self):
+        """x: 진행 중인 Demo_N 을 버리고 같은 번호로 처음부터 다시 수집.
+
+        저장(h5 그룹/JPEG)은 발판을 뗄 때 _save_demo 에서만 일어나므로, 수집 중인 데모는
+        아직 전부 메모리에 있다 → 버퍼만 비우면 된다. 이미 저장된 데모는 손대지 않는다.
+        """
+        if not self.recording:
+            self.get_logger().warn("x: 로깅 중이 아님 — 저장된 데모는 건드리지 않는다")
+            return
+        n, n_rgb = len(self.buffer), len(self.rgb_frames)
+        self._reset_episode()
+        self.get_logger().info(
+            f"↺ Demo_{self.demo_idx} 폐기 ({n} step, RGB {n_rgb}장) — 같은 번호로 다시 수집 중")
+
+    def _reset_episode(self):
+        """에피소드 버퍼를 비우고 시간축을 0 으로 되돌린다 (S 시작 / x 재시작 공용)."""
+        self.buffer = []
+        self.rgb_frames, self.rgb_t, self.rgb_stamp = [], [], []
+        # _rgb_msg 를 비우지 않으면 첫 스텝이 "발판 누르기 전" 프레임을 가리켜 임의로 낡은
+        # 이미지가 들어간다. 새 프레임이 올 때까지 index=-1 로 두는 게 맞다.
+        self._rgb_msg = None
+        self._rgb_stored_seq, self._rgb_idx = -1, -1
+        self.t_demo_start = time.perf_counter()
+
     def _on_enable(self, msg: Bool):
         if msg.data and not self.recording:      # S: 시작
             if self.f is None:
                 self._open_file()
-            self.buffer = []
-            self.rgb_frames, self.rgb_t, self.rgb_stamp = [], [], []
-            # _rgb_msg 를 비우지 않으면 첫 스텝이 "발판 누르기 전" 프레임을 가리켜 임의로 낡은
-            # 이미지가 들어간다. 새 프레임이 올 때까지 index=-1 로 두는 게 맞다.
-            self._rgb_msg = None
-            self._rgb_stored_seq, self._rgb_idx = -1, -1
-            self.t_demo_start = time.perf_counter()
+            self._reset_episode()
             self.recording = True
             miss = [n for n in self.dims if n not in self.seen]
             self.get_logger().info(f">>> 수집 시작 Demo_{self.demo_idx}"
@@ -403,13 +427,15 @@ class Recorder(Node):
 
 
 def _key_loop(node: Recorder):
-    """엔터 없이 1글자씩 읽어 k 를 롤오버 요청으로 넘긴다 (터미널은 main 이 원복)."""
+    """엔터 없이 1글자씩 읽어 k(롤오버)/x(데모 재수집) 요청을 넘긴다 (터미널은 main 이 원복)."""
     while True:
         ch = sys.stdin.read(1)
         if not ch:
             return
         if ch in ("k", "K"):
             node.roll_req = True
+        elif ch in ("x", "X"):
+            node.redo_req = True
 
 
 def main():
@@ -436,7 +462,7 @@ def main():
         threading.Thread(target=_key_loop, args=(node,), daemon=True).start()
     elif not args.check:
         # nohup/백그라운드 등 tty 없이 띄우면 키를 읽을 수 없다 — 조용히 안 먹는 것보다 알려준다.
-        node.get_logger().warn("tty 아님 → k 키 롤오버 사용 불가 (터미널에서 직접 실행하세요)")
+        node.get_logger().warn("tty 아님 → k/x 키 사용 불가 (터미널에서 직접 실행하세요)")
 
     try:
         rclpy.spin(node)
