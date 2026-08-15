@@ -414,7 +414,7 @@ def run_ros(args):
     info = args.info_topic or discover(node, args.raw)[1]
     if not color:
         print("✗ 컬러 이미지 토픽을 못 찾음 — 제어 PC realsense 켜졌는지 확인\n"
-              "  (또는 --color-topic /camera/camera/color/image_raw --raw)")
+              "  (또는 --color-topic /front_cam/front/color/image_raw --raw)")
         node.destroy_node(); rclpy.shutdown(); return
     print(f"구독: color={color}\n      info ={info or '없음(K 없으면 박스 안 그려짐)'}\n"
           f"      pose =/fruit/pose  size=/fruit/size\n키: q=종료  s=스냅샷")

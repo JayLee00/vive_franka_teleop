@@ -11,8 +11,8 @@
 ```
 Vive PC (192.168.0.1)                                   제어 PC (192.168.0.100)
 SteamVR ─ viz_node ─ /vive/{l,r}/pose ─┐
-                                        └ teleop_delta ─ /franka_{r,l}/ee_target_world ─LAN▶ IK+임피던스 ─ FR3 2팔
-        /franka/ee_pose_{r,l} ◀───────────┘ (engage 순간 EE 앵커 T_ee0 캡처)
+                                        └ teleop_delta ─ /franka/<side>/ee_target_world ─LAN▶ IK+임피던스 ─ FR3 2팔
+        /franka/<side>/ee_pose ◀──────────┘ (engage 순간 EE 앵커 T_ee0 캡처)
 글러브(USB 시리얼) ─ glove_teleop ─ /hand/<side>/q_target + cmd_servo|mode ─LAN▶ hand_target_receiver ─ 4지 핸드
 풋스위치 ─ foot_pedal ─ /teleop/engage/{l,r}(팔) + /teleop/hand_engage/<side>(손) + /record/enable(로깅)
 ```
@@ -33,7 +33,9 @@ SteamVR ─ viz_node ─ /vive/{l,r}/pose ─┐
   `/dev/serial/by-path/...` 로 좌/우를 고정해 `--port` 로 넘겨야 한다. (현재는 오른손 1개)
 - **풋스위치 권한**: `sudo usermod -aG input $USER` → 재로그인 (또는 실행 셸에서 `newgrp input`).
 - **네트워크**(1회, sudo): `sudo bash ~/Desktop/vive_franka_teleop/scripts/fix_ros_net.sh` (enp6s0→192.168.0.1 고정).
-- (코드 수정 후) 빌드: `cd ~/franka_ros2_ws && colcon build --packages-select vive_3d_viz --symlink-install`
+- (코드 수정 후) 빌드: `cd ~/franka_ros2_ws && colcon build --packages-select vive_3d_viz`
+  (`--symlink-install` 은 현재 setuptools 에서 `option --editable not recognized` 로 실패 —
+   빼고 빌드할 것. 대신 소스 수정 때마다 재빌드 필요)
 
 ### 공통 환경 — 새 터미널마다 맨 위에
 ```bash
@@ -48,13 +50,22 @@ export FASTRTPS_DEFAULT_PROFILES_FILE=~/Desktop/vive_franka_teleop/config/fastdd
 bash ~/Desktop/vive_franka_teleop/scripts/start_teleop.sh both     # vive 팔 + 글러브 손 (기본)
 bash ~/Desktop/vive_franka_teleop/scripts/start_teleop.sh vive     # vive 팔만
 bash ~/Desktop/vive_franka_teleop/scripts/start_teleop.sh glove    # 글러브 손만 (현재 오른손 1개)
+
+# 모드 뒤 인자는 글러브로 그대로 통과 (run_glove_paxini.sh → glove_teleop.py)
+bash ~/Desktop/vive_franka_teleop/scripts/start_teleop.sh both --DexFIT            # 촉각보조 ON
+bash ~/Desktop/vive_franka_teleop/scripts/start_teleop.sh glove --DexFIT --dry-run # 손 안움직이고 값만
 ```
+**`--DexFIT`**(촉각보조): 글러브에 달린 Paxini 의 손가락별 Fz 로 그 손가락 굽힘 관절에 추가 각도를 준다
+(`target[j] = clamp(글러브각도[j] + GAIN*SCALE*Fz[finger])`). 게인·매핑은 `tools/glove_teleop.py` 상단
+"── 6. 촉각 보조 (DexFIT)" 에서 조정. **글러브 Paxini**(`/glove/paxini/<side>/ft`, `paxini_uart_node.py`
+@`/dev/ttyACM0`)를 쓰며 **로봇 핸드의 `/paxini/<side>/ft` 와는 다르다** — 런처가 `run_glove_paxini.sh`
+로 촉각 노드까지 같이 띄운다. 첫 실행은 `--dry-run` 권장.
 모드에 따라 아래를 순서대로 띄운다(**안전 순서**: 정리 → 페달 → vive → 글러브).
 
 | 모드 | 띄우는 것 |
 |---|---|
-| `vive` | 페달 + `viz_node`(트래커→`/vive/{l,r}/pose`) + `teleop_delta`(→`/franka_{r,l}/ee_target_world`) |
-| `glove` | 페달 + `glove_teleop --side right` (vive 파이프라인은 내림) |
+| `vive` | 페달 + `viz_node`(트래커→`/vive/{l,r}/pose`) + `teleop_delta`(→`/franka/<side>/ee_target_world`) |
+| `glove` | 페달 + `run_glove_paxini.sh right`(글러브+촉각) (vive 파이프라인은 내림) |
 | `both` | 위 전부 |
 
 **페달을 먼저 띄우는 이유**: 페달이 STOP 을 latched(TRANSIENT_LOCAL)로 깔아두면, 뒤에 뜨는
@@ -85,23 +96,28 @@ python3 ~/Desktop/vive_franka_teleop/scripts/ee_monitor.py
 ## 토픽 / 메시지
 | 방향 | 토픽 | 타입 | 비고 |
 |---|---|---|---|
-| 발행(팔) | `/franka_{r,l}/ee_target_world` | geometry_msgs/PoseStamped | **절대 EE 타겟** (franka base `fr3_link0_{r,l}`), engage 중에만 |
+| 발행(팔) | `/franka/<side>/ee_target_world` | geometry_msgs/PoseStamped | **절대 EE 타겟** (franka base `fr3_link0_{r,l}`), engage 중에만 |
 | 발행(팔,디버그) | `/teleop/delta/{left,right}` | std_msgs/String(JSON) | Δp·ΔR·engaged·valid (로컬 모니터용) |
 | 클러치(팔) | `/teleop/engage/{left,right}` | std_msgs/Bool | true=engage / false=stop |
-| 구독(팔) | `/franka/ee_pose_{r,l}` | geometry_msgs/PoseStamped | 제어PC 실제 EE(200Hz), engage 시 앵커 |
+| 구독(팔) | `/franka/<side>/ee_pose` | geometry_msgs/PoseStamped | 제어PC 실제 EE(200Hz), engage 시 앵커 |
 | 발행(손) | `/hand/<side>/q_target` | std_msgs/Float32MultiArray[16] | 관절 타겟(엔코더 카운트), side=right\|left |
 | 발행(손) | `/hand/<side>/cmd_servo` · `/hand/<side>/cmd_mode` | std_msgs/Bool · Int32 | 서보 on/off · mode(1=position) |
 | 클러치(손) | `/teleop/hand_engage/<side>` | std_msgs/Bool | latched. glove_teleop 게이팅 |
 | 발행(글러브) | `/glove/<side>/q_raw` | std_msgs/Float32MultiArray[16] | 글러브 엔코더 raw |
+| 촉각(DexFIT) | `/glove/paxini/<side>/ft` | std_msgs/Float32MultiArray[12] | 글러브 Paxini 4손가락×3축 |
 | 로깅 | `/record/enable` | std_msgs/Bool | true=에피소드 시작 / false=저장 |
 | 트래커 | `/vive/{left,right}/pose` · `/vive/{...}/valid` | PoseStamped · Bool | vive_world, +Y up |
 
-> ⚠️ 손 토픽은 제어 PC 개편으로 **per-side 네이밍**(`/hand/right/q_target`)이다. 구 네이밍
-> (`/hand/q_target_r` 등)을 쓰는 `scripts/foot_pedal_teleop.py`·`scripts/hand_target_test.py`는
-> 현재 제어 PC와 맞지 않는다(미갱신). 페달은 `scripts/foot_pedal.py` 를 쓸 것.
+> ⚠️ 제어 PC 개편으로 팔·손 토픽 모두 **per-side 네이밍**이다
+> (`/franka/right/ee_pose`, `/franka/right/ee_target_world`, `/hand/right/q_target`).
+> `teleop_delta`·`ee_monitor.py` 는 갱신 완료. 구 네이밍(`/hand/q_target_r` 등)을 쓰는
+> `scripts/foot_pedal_teleop.py`·`scripts/hand_target_test.py` 는 미갱신 — 페달은 `scripts/foot_pedal.py` 를 쓸 것.
 
 파라미터(`config/teleop_params.yaml`): `ee_scale`(트래커→로봇 위치 스케일, 1.0=1:1), `publish_ee_target`, `ee_timeout`, `r_align_{right,left}`(트래커↔로봇 정렬 3×3, 기본 단위).
 제어 PC 수신측 계약: `docs/VIVE_PC_HANDOFF.md`(팔) · `docs/GLOVE_PC_HANDOFF.md`(손) · 수집 절차 `docs/DATA_COLLECTION_USAGE.md`.
+
+> 📖 **모든 스크립트·파이썬 파일의 실행법은 [`docs/SCRIPTS_AND_TOOLS.md`](docs/SCRIPTS_AND_TOOLS.md) 에 정리돼 있다.**
+> 새 PC 이관(모델 배포 + 과일 인식 + 시각화)은 [`Visualization/PACKAGE_README.md`](Visualization/PACKAGE_README.md).
 
 ## 네트워크 (전용 LAN)
 - 이 PC enp6s0 = `192.168.0.1/24`, 제어 PC = `192.168.0.100/24`, 직결 GbE.
@@ -121,7 +137,9 @@ scripts/
   run_tracker_read.sh / run_delta_monitor.sh / run_delta_viz.sh   (선택) 델타/트래커 확인 도구
   fix_ros_net.sh             네트워크 고정(sudo)
   foot_pedal_teleop.py / hand_target_test.py   (구 네이밍, 미갱신 — 위 ⚠️ 참고)
+  run_glove_paxini.sh        글러브 텔레옵 + 글러브 Paxini 촉각 (--DexFIT 여기로)
 tools/glove_teleop.py        글러브 시리얼 → 핸드 q_target (1:1, 램프·EMA·자동재연결)
+tools/paxini_uart_node.py    글러브 Paxini UART → /glove/paxini/<side>/ft
 record/                      데이터 수집 (ros2_hdf5_recorder.py, foot_pedal_glove.py, 인지/시각화 도구)
 src/vive_3d_viz/             핵심 ROS2 패키지 (viz_node, teleop_delta) — franka_ros2_ws/src 에 심볼릭
 config/                      viz_params.yaml, teleop_params.yaml, fastdds_lan_only*.xml

@@ -24,10 +24,10 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from geometry_msgs.msg import PoseStamped
 
 TOPICS = [
-    ('TARGET R', '/franka_r/ee_target_world'),
-    ('TARGET L', '/franka_l/ee_target_world'),
-    ('EEPOSE R', '/franka/ee_pose_r'),
-    ('EEPOSE L', '/franka/ee_pose_l'),
+    ('TARGET R', '/franka/right/ee_target_world'),
+    ('TARGET L', '/franka/left/ee_target_world'),
+    ('EEPOSE R', '/franka/right/ee_pose'),
+    ('EEPOSE L', '/franka/left/ee_pose'),
 ]
 
 

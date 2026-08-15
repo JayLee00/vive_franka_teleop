@@ -1,0 +1,24 @@
+# ══ 08 · [축4 주파수] rgb:tactile = 1:3 ═══════════════════════════════════
+# rgb 16.7Hz / tactile 50Hz. 하드웨어 실제 비율(카메라 ~30Hz vs 촉각 100Hz)에 가장 가깝다.
+#   rgb     stride 6, horizon 2 → offsets [-6, 0]
+#   tactile stride 2, horizon 4 → offsets [-6, -4, -2, 0]
+_base_: 01_anchor.yaml
+
+obs_spec:
+  state:   {kind: state,   keys: ["03_hand_j_pos", "06_hand_j_kin", "30_fruit_pos", "32_fruit_size"], shape: 34, horizon: 2, stride: 6, encoder: mlp}
+  tactile:
+    kind: tactile
+    keys: ["20_paxini_ft"]
+    shape: 12
+    horizon: 4
+    stride: 2
+    encoder: lstm
+    encoder_kwargs: {n_part: 4, return_seq: true}     # 4손가락 x 4스텝 = 16토큰
+  rgb:
+    kind: vision
+    keys: ["40_rgb_jpeg"]
+    shape: [3, 224, 224]
+    horizon: 2
+    stride: 6
+    encoder: resnet18
+    encoder_kwargs: {pretrained: true, frozen: false, norm: auto, tokens: pool, num_kp: 32}

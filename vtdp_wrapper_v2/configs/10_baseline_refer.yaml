@@ -1,0 +1,18 @@
+# ══ 10 · 기준선 — refer/ 정확 재현 ════════════════════════════════════════
+# 46차원 통짜 obs + 공유 MLP 하나 + FiLM U-Net. RGB 없음.
+# 파라미터까지 refer/dp_unet 과 일치(2,469,200). **모든 비교의 원점.**
+# 이걸 못 이기면 위의 9개는 의미가 없다.
+_base_: _base.yaml
+
+obs_spec:
+  state:
+    kind: state
+    keys: ["03_hand_j_pos", "06_hand_j_kin", "20_paxini_ft", "30_fruit_pos", "32_fruit_size"]
+    shape: 46
+    horizon: 2
+    stride: 5
+    encoder: mlp
+
+model:
+  fusion: passthrough
+  fusion_kwargs: {}

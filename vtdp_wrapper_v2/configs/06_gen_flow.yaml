@@ -1,0 +1,9 @@
+# ══ 06 · [축3 생성기] diffusion → flow matching ═══════════════════════════
+# rectified flow. x_τ=(1-τ)·noise+τ·x0, 목표 v=x0-noise, τ~Beta(1.5,1), Euler 적분.
+# ⚠️ ManiFeel 이 같은 조건에서 DP·Equivariant DP 와 비교했고 flow 가 둘 다에 뒤졌다.
+#    축으로 요청하셔서 넣었지만 기대치는 낮게 잡을 것.
+_base_: 01_anchor.yaml
+
+model:
+  head: flow
+  head_kwargs: {infer_steps: 10, beta_a: 1.5, beta_b: 1.0}

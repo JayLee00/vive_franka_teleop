@@ -12,7 +12,7 @@
     --sync        발판 로깅(/record/enable)에 맞춰 녹화도 자동 시작/정지 (에피소드와 동기)
     --no-window   창 없이 녹화만 (헤드리스; --sync 로만 제어). 서버/테스트용.
     --raw         raw Image 토픽 사용(기본은 compressed)
-    --topic-ns    카메라 네임스페이스 (기본 /camera/camera)
+    --topic-ns    카메라 네임스페이스 (기본 /front_cam/front)
     --fps         저장 fps (기본 30)
 
 실행:
@@ -111,7 +111,7 @@ def main():
     ap.add_argument("--sync", action="store_true", help="/record/enable(발판)에 맞춰 자동 녹화")
     ap.add_argument("--no-window", action="store_true", help="창 없이 녹화만(--sync 제어)")
     ap.add_argument("--raw", action="store_true", help="raw Image 토픽 사용(기본 compressed)")
-    ap.add_argument("--topic-ns", default="/camera/camera", help="카메라 네임스페이스")
+    ap.add_argument("--topic-ns", default="/front_cam/front", help="카메라 네임스페이스")
     ap.add_argument("--fps", type=float, default=30.0)
     args = ap.parse_args()
 

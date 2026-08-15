@@ -41,7 +41,7 @@ from std_msgs.msg import Bool, Float32MultiArray, Int32
 
 # ── 1. 연결 ────────────────────────────────────────────────────────────────
 PORT = "auto"                  # "auto"=CH340 자동 탐지(포트 바뀌어도 OK). 고정하려면 "/dev/ttyUSB0"
-BAUD = 500000                  # ★ 글러브 펌웨어 Serial.begin() 과 반드시 일치 (현재 500000)
+BAUD = 5000000
 SIDE = "right"                 # "right"(=핸드0) | "left"(=핸드1)
                                # (발행 주기 설정 없음: 글러브에서 프레임이 오는 즉시 발행 = 장치 최대 속도 ~108Hz)
 
@@ -105,32 +105,6 @@ for _i in (4, 8, 12):                              # 검지/중지/약지 외전
     HAND_LIMITS[_i] = (-1000, 1000)
 for _i in (3, 7, 11, 15):                          # 엄지 IP / 검지·중지·약지 DIP
     HAND_LIMITS[_i] = (-2048, 4096)                #   글러브가 음수로 나오는 구간 허용
-
-# ── 6. 촉각 보조 (DexFIT) — paxini Fz 로 굽힘 관절에 추가 각도 ──────────────
-# 손가락이 물체에 닿아 Fz 가 커지면 그 손가락의 굽힘 관절을 더 굽혀 "더 꽉" 쥐게 한다.
-#     target[j] = clamp( 글러브각도[j] + PAXINI_GAIN * PAXINI_SCALE * Fz[finger] )
-# --dexfit (= run_glove_paxini.sh --DexFIT) 로 켠다. 기본은 꺼짐.
-PAXINI_ASSIST = False          # True 면 옵션 없이도 항상 켜짐
-# ★ 글러브에 달린 Paxini 를 쓴다 (/dev/ttyACM0 → paxini_uart_node.py → /glove/paxini/<side>/ft).
-#   로봇 핸드에도 같은 센서가 달려 /paxini/<side>/ft 로 나오는데 그건 로봇 것이라 쓰면 안 된다.
-PAXINI_TOPIC = None            # None = f"/glove/paxini/{SIDE}/ft" 자동. 다르면 직접 지정
-PAXINI_NUM_FINGER = 4          # 토픽 길이 12 = 4손가락 x 3축 (SENSOR_NUM=4, AXIS_NUM=3)
-PAXINI_FZ_AXIS = 2             # 손가락별 3축 중 Fz 위치. paxini_uart_node 는 (Fx,Fy,Fz) 순서라 2.
-                               #   ※ 그 노드 주석에 "제어 PC nd 가 재배열하는지 미확인" 경고가 있음.
-                               #     --dry-run 으로 손가락을 눌러보고 반응하는 축이 다르면 이 값을 바꾼다.
-PAXINI_GAIN = 1000.0           # 추가각도 = GAIN * SCALE * Fz  [count]
-PAXINI_SCALE = 1.1
-# 손가락 인덱스(0~3) -> 추가 각도를 넣을 핸드 관절 번호들 (굽힘 계열만)
-PAXINI_MAP = {
-    0: (2, 3),                 # 엄지: mcp, ip
-    1: (5, 6, 7),              # 검지: mcp_flexion, pip, dip
-    2: (9, 10, 11),            # 중지
-    3: (13, 14, 15),           # 약지
-}
-PAXINI_DEADZONE = 0.0          # |Fz| 가 이 값 이하면 무시 (노이즈 컷)
-PAXINI_MAX_EXTRA = 1500.0      # 관절당 추가 각도 상한 [count] — 폭주 방지 안전장치
-PAXINI_EMA = 0.5               # Fz 저역통과 (1.0 = 필터 없음, 낮을수록 부드럽게)
-PAXINI_STALE_SEC = 0.5         # 촉각 수신이 이 시간 이상 끊기면 보조를 0 으로 (안전)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  이하 구현
@@ -208,7 +182,7 @@ def clamp(idx: int, value: float) -> float:
 
 
 class GloveTeleop(Node):
-    def __init__(self, port: str, side: str, dry_run: bool, dexfit: bool = False):
+    def __init__(self, port: str, side: str, dry_run: bool):
         super().__init__("glove_teleop")
         self.side = side
         self.dry_run = dry_run
@@ -226,17 +200,6 @@ class GloveTeleop(Node):
 
         # 발판 제어권: engage=False 면 q_target 홀드(손 안 움직임). 발판 없으면 기본 engage.
         self.engaged = True
-        # 촉각 보조(DexFIT): paxini Fz → 굽힘 관절 추가 각도
-        self.dexfit = dexfit or PAXINI_ASSIST
-        self.fz = [0.0] * PAXINI_NUM_FINGER      # 필터된 Fz
-        self.fz_rx = 0.0                          # 마지막 촉각 수신 시각
-        if self.dexfit:
-            topic = PAXINI_TOPIC or f"/glove/paxini/{side}/ft"
-            self.create_subscription(Float32MultiArray, topic, self._on_paxini, SENSOR_QOS)
-            self.get_logger().info(
-                f"DexFIT 촉각보조 ON — {topic}  추가각도 = {PAXINI_GAIN:.0f}*{PAXINI_SCALE}*Fz "
-                f"(관절당 최대 {PAXINI_MAX_EXTRA:.0f} count)")
-
         self.create_subscription(Bool, f"/teleop/hand_engage/{side}",
                                  self._on_engage, ENGAGE_QOS)
 
@@ -297,44 +260,12 @@ class GloveTeleop(Node):
             self.engaged = new
             self.get_logger().info(f"발판: 제어권 {'ENGAGE(스트리밍)' if new else 'DISENGAGE(홀드)'}")
 
-    def _on_paxini(self, msg: Float32MultiArray):
-        """paxini FT(4손가락 x 3축) → 손가락별 Fz 만 뽑아 저역통과."""
-        d = msg.data
-        for i in range(PAXINI_NUM_FINGER):
-            k = i * 3 + PAXINI_FZ_AXIS
-            if k >= len(d):
-                continue
-            v = float(d[k])
-            self.fz[i] = v if PAXINI_EMA >= 1.0 else \
-                PAXINI_EMA * v + (1.0 - PAXINI_EMA) * self.fz[i]
-        self.fz_rx = time.time()
-
-    def _paxini_extra(self, now: float) -> dict:
-        """손가락 Fz → {핸드관절: 추가각도[count]}. 수신 끊기면 전부 0(안전)."""
-        if not self.dexfit or now - self.fz_rx > PAXINI_STALE_SEC:
-            return {}
-        extra = {}
-        for finger, joints in PAXINI_MAP.items():
-            if finger >= len(self.fz):
-                continue
-            fz = self.fz[finger]
-            if abs(fz) <= PAXINI_DEADZONE:
-                continue
-            e = PAXINI_GAIN * PAXINI_SCALE * fz
-            e = max(-PAXINI_MAX_EXTRA, min(PAXINI_MAX_EXTRA, e))   # 폭주 방지
-            for j in joints:
-                extra[j] = e
-        return extra
-
     def _map_to_hand(self, g: list) -> list:
-        """글러브 16채널 → 핸드 16타겟 (기본 1:1). DexFIT 이면 Fz 추가각도를 더한다."""
+        """글러브 16채널 → 핸드 16타겟 (기본 1:1)."""
         out = [0.0] * NUM_CH
         for hand_idx, _name, ch, scale, offset, on in JOINTS:
             raw = g[ch] * scale + offset if on else offset
             out[hand_idx] = clamp(hand_idx, raw)
-        if self.dexfit:
-            for j, e in self._paxini_extra(time.time()).items():
-                out[j] = clamp(j, out[j] + e)   # 더한 뒤 하드리밋 재적용
         return out
 
     def _try_open(self) -> bool:
@@ -498,44 +429,16 @@ class GloveTeleop(Node):
             self.get_logger().warn(f"글러브 수신 없음 — {self.port} 확인")
             return
         tag = "DRY" if self.dry_run else "RUN"
+        g = " ".join(f"{v:6.0f}" for v in self.g_last[:8])
         if self.hand_q is None:
-            g = " ".join(f"{v:6.0f}" for v in self.g_last[:8])
             self.get_logger().warn(
                 f"[{tag}] glove[0:8] {g} | /hand/{self.side}/joint_states 대기 중 "
                 "(shm + nd 떠 있는지 확인)")
             return
-        # 16관절 전체를 손가락별 4줄로. 각 칸은 "글러브 raw→핸드 타겟" [count].
-        # 글러브 채널은 JOINTS 표에서 끌어온다(관절을 다른 채널에 묶어도 맞게 나온다).
-        # 발판 disengage 면 타겟이 아직 없다 — 그때도 글러브 raw 는 보여준다.
-        # "!" = HAND_LIMITS 에 걸려 잘린 관절. 글러브가 움직여도 타겟이 한계값에
-        #       고정되므로, raw 는 살아있는데 타겟만 안 바뀌는 상황을 여기서 바로 잡는다.
-        src = {hand_idx: (ch, scale, offset, on)
-               for hand_idx, _n, ch, scale, offset, on in JOINTS}
-        rows = []
-        for label, base in (("thumb", 0), ("index", 4), ("middle", 8), ("ring", 12)):
-            cells = []
-            for i in range(base, base + 4):
-                ch, scale, offset, on = src[i]
-                g = self.g_last[ch]
-                pre = g * scale + offset if on else offset      # 클램프 전 값
-                hit = "!" if clamp(i, pre) != pre else " "
-                tgt = f"{self.last_target[i]:<6.0f}" if self.last_target else "  --  "
-                cells.append(f"{g:>6.0f}→{tgt}{hit}")
-            rows.append(f"  {label:<7}" + " ".join(cells))
-        state = "engage" if self.engaged else "DISENGAGE(발판 대기, 타겟 홀드)"
-        dex = ""
-        if self.dexfit:
-            stale = time.time() - self.fz_rx > PAXINI_STALE_SEC
-            ex = self._paxini_extra(time.time())
-            fz = " ".join(f"{v:+.3f}" for v in self.fz)
-            add = " ".join(f"{ex.get(j, 0.0):+.0f}" for j in (2, 5, 9, 13))
-            dex = (f"\n  DexFIT  Fz[4] {fz}"
-                   f"  →추가각도(엄지/검지/중지/약지) {add}"
-                   + ("   ⚠ 촉각 수신 끊김 → 보조 0" if stale else ""))
-        self.get_logger().info(
-            f"[{tag}] {state}  glove→target [count] (1 count = pi/8192 rad, 4096=90°)  "
-            "엄지=(cmc_opp,cmc_abd,mcp,ip) 나머지=(abd,flex,pip,dip)  !=클램프\n"
-            + "\n".join(rows) + dex)
+        if self.last_target is None:
+            return
+        t = " ".join(f"{v:6.0f}" for v in self.last_target[:8])
+        self.get_logger().info(f"[{tag}] glove[0:8] {g}\n        target[0:8] {t}")
 
     def shutdown(self):
         self._stop.set()                      # 읽기 스레드 정지
@@ -558,10 +461,6 @@ def main() -> None:
     ap.add_argument("--side", choices=["right", "left"], default=SIDE)
     ap.add_argument("--dry-run", action="store_true",
                     help="핸드 타겟 미발행 (글러브 raw만 SHM에 기록)")
-    # 대소문자 둘 다 받는다 (스크립트는 --DexFIT 로 부른다)
-    ap.add_argument("--dexfit", "--DexFIT", dest="dexfit", action="store_true",
-                    help="촉각 보조: paxini Fz 로 굽힘 관절에 추가 각도 "
-                         f"(={PAXINI_GAIN:.0f}*{PAXINI_SCALE}*Fz, 관절당 최대 {PAXINI_MAX_EXTRA:.0f})")
     args = ap.parse_args()
 
     dry_run = args.dry_run or DRY_RUN
@@ -569,7 +468,7 @@ def main() -> None:
         print(f">>> DRY-RUN: /hand/{args.side}/q_target 발행 안 함 (손 안 움직임)\n")
 
     rclpy.init()
-    node = GloveTeleop(args.port, args.side, dry_run, dexfit=args.dexfit)
+    node = GloveTeleop(args.port, args.side, dry_run)
     try:
         rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException):

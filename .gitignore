@@ -12,13 +12,24 @@ log/
 vendor/
 
 # 수집 데이터 / 모델 가중치 / 별도 저장소 — git 추적만 제외(파일은 그대로 둔다)
-hdf5/                 # 수집 원본 h5 (재생성 불가, 절대 삭제 금지)
-!hdf5/*.py            #   단 그 안의 스크립트는 추적
-record/logs/          # 수집 원본 h5 (동상)
-record/snapshots/     # 실행 산출 PNG
-fruit-manipulation/   # 1.5G, 자체 .git (별도 저장소)
-foundation_pose/      # 모델 가중치 포함
-diffusion_policy/     # 학습 런/체크포인트 포함
+# ⚠️ .gitignore 는 "같은 줄 뒤 주석"을 지원하지 않는다.
+#    `record/logs/   # 설명` 처럼 쓰면 주석까지 패턴에 포함돼 매칭이 안 된다.
+#    주석은 반드시 이렇게 별도 줄에 쓸 것.
+
+# 수집 원본 h5 (재생성 불가, 절대 삭제 금지). 단 그 안의 스크립트는 추적.
+#   디렉터리 자체를 제외하면(`hdf5/`) 내부 파일을 !로 되살릴 수 없다 → `hdf5/*` 로 써야 한다.
+hdf5/*
+!hdf5/*.py
+# 수집 원본 h5 (동상)
+record/logs/
+# 실행 산출 PNG
+record/snapshots/
+# 1.5G, 자체 .git (별도 저장소)
+fruit-manipulation/
+# 모델 가중치 포함
+foundation_pose/
+# 학습 런/체크포인트 포함
+diffusion_policy/
 Obj/
 .claude/
 *.log

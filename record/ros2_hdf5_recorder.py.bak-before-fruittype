@@ -5,11 +5,6 @@
 고정 주기(기본 100Hz)로 스냅샷 → 에피소드(Demo_N)로 HDF5에 저장한다.
 스키마는 제어 PC의 hdf5_log_with_realsense_new.py(Demo_N/NN_name)를 따르고 과일 pose를 추가.
 
-RGB(--rgb-on)는 h5 안에 넣지 않고 옆 폴더에 JPEG 파일로 떨군다:
-    record/logs/exp_20260806_143000.h5            <- 저차원 + 이미지 번호
-    record/logs/exp_20260806_143000_image/Demo_0/000000.jpg, 000001.jpg, ...
-h5 의 Demo_N/40_image[step] 이 그 스텝에 보이던 파일 번호다(-1 = 아직 프레임 없음).
-
 시작/종료(에피소드 경계)는 발판 노드(foot_pedal_glove.py)가 발행하는
     /record/enable  (std_msgs/Bool)   True=수집 시작(S), False=수집 종료 후 저장(E)
 로 제어. (키보드 대신 발판. 토픽이라 어느 노드에서든 토글 가능.)
@@ -47,7 +42,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import CameraInfo, CompressedImage, JointState
 from geometry_msgs.msg import PoseArray, PoseStamped
-from std_msgs.msg import Bool, Float32MultiArray, Float64, Int32, Int32MultiArray, String
+from std_msgs.msg import Bool, Float32MultiArray, Float64, Int32MultiArray
 
 # ── 설정 ────────────────────────────────────────────────────────────────────
 SIDE = "right"
@@ -55,18 +50,17 @@ RATE_HZ = 100.0                       # 스냅샷 주기 (학습용 100Hz면 충
 OUT_DIR = Path(__file__).resolve().parent / "logs"
 
 # ── RGB(--rgb-on) ───────────────────────────────────────────────────────────
-# 카메라가 이미 JPEG(CompressedImage)로 발행하므로 바이트를 그대로 .jpg 파일로 쓴다
+# 카메라가 이미 JPEG(CompressedImage)로 발행하므로 바이트를 그대로 저장한다
 # (재인코딩 없음 = CPU 0, 화질 손실 0). 실측: 640x480, 28.8Hz, 106KB/프레임.
-# 파일로 빼두면 h5 가 가벼워서 저차원만 훑는 스크립트가 빨라지고, 이미지는 뷰어로 바로 열린다.
 #
 # ⚠️ 100Hz 스텝마다 프레임을 복사하면 41GB/시간이 된다. 그래서 고유 프레임만 한 번 저장하고
-#    스텝별로는 파일 번호만 남긴다(중복 제거 3.47x) → --rgb-every 1 에서 약 12GB/시간.
+#    스텝별로는 인덱스만 남긴다(중복 제거 3.47x) → --rgb-every 1 에서 약 12GB/시간.
 #    (DROID 가 쓰는 방식. ALOHA 는 고정길이 패딩 + 매 스텝 복사라 용량을 더 쓴다.)
 #    용량을 줄이려면 발행측 jpeg_quality 를 낮추는 게 가장 효과적:
 #      q95(기본) 112KB→12GB/h   q85 64KB→6.8GB/h   q80 56KB→5.9GB/h
-#      ros2 param set /front_cam/front .front.color.image_raw.jpeg_quality 80
-RGB_TOPIC = "/front_cam/front/color/image_raw/compressed"
-RGB_INFO_TOPIC = "/front_cam/front/color/camera_info"
+#      ros2 param set /camera/camera .camera.color.image_raw.jpeg_quality 80
+RGB_TOPIC = "/camera/camera/color/image_raw/compressed"
+RGB_INFO_TOPIC = "/camera/camera/color/camera_info"
 
 # 각 필드: (HDF5 데이터셋 이름, 소스 토픽, 메시지 타입, 차원, 추출 함수)
 #   추출 함수: 메시지 -> 길이 dim 의 1D float 리스트
@@ -75,7 +69,7 @@ def _js_eff(m):  return list(m.effort)            # 16 or 7 (모터 전류/토�
 def _js_vel(m):  return list(m.velocity)          # 7
 def _js_tgt(m):  return list(m.position)          # 16 (target_joint_states)
 def _fma(m):     return list(m.data)              # 가변
-def _f64(m):     return [float(m.data)]          # 스칼라 (Float64 / Int32 공용)
+def _f64(m):     return [float(m.data)]
 def _hand_mode(m): return [float(m.data[0])] if m.data else [0.0]
 def _hand_servo(m): return [float(m.data[1])] if len(m.data) > 1 else [0.0]
 def _tip_pos(m): return [v for p in m.poses for v in (p.position.x, p.position.y, p.position.z)]      # 4*3
@@ -83,14 +77,8 @@ def _tip_quat(m):return [v for p in m.poses for v in (p.orientation.x, p.orienta
 def _ps_pos(m):  return [m.pose.position.x, m.pose.position.y, m.pose.position.z]                        # PoseStamped 위치
 def _ps_quat(m): return [m.pose.orientation.x, m.pose.orientation.y, m.pose.orientation.z, m.pose.orientation.w]  # PoseStamped 방향
 
-# name, topic, msg_type, dim, extractor
-#   번호 = 보기 편한 묶음 순서: 로봇핸드(01~11) → 로봇암(12~20) → 글러브(21~23) → 과일(30~34)
-#          → 나머지(40_image, 41_rgb_time, 42_rgb_stamp) → 클락(50/51). h5 는 이름순으로 나열되므로
-#          번호가 곧 표시 순서다. FIELDS 순서가 아니라 번호가 순서를 정한다.
-#   ※ 40/41/42(이미지)와 50/51(클락)은 토픽 추출이 아니라 레코더가 만드는 값이라 여기 없다(_tick/_save_demo).
-#   ※ 제어PC 스키마(hdf5_log_with_realsense_new.py)와 번호가 어긋난다 — 2026-08-06 이전 파일은 옛 번호.
+# name, topic, msg_type, dim, extractor  (번호 순 = hdf5_log_with_realsense_new.py + paxini 20번대 + 과일 30번대)
 FIELDS = [
-    # ── 로봇 핸드 ──
     ("01_hand_mode",             f"/hand/{SIDE}/mode",                Int32MultiArray,   1,    _hand_mode),
     ("02_hand_servo_on",         f"/hand/{SIDE}/mode",                Int32MultiArray,   1,    _hand_servo),
     ("03_hand_j_pos",            f"/hand/{SIDE}/joint_states",        JointState,        16,   _js_pos),
@@ -100,31 +88,22 @@ FIELDS = [
     ("07_hand_j_tac",            f"/hand/{SIDE}/tac_legacy",          Float32MultiArray, 4,    _fma),
     ("08_hand_tip_pos",          f"/hand/{SIDE}/fingertip_poses",     PoseArray,         12,   _tip_pos),
     ("09_hand_tip_quat",         f"/hand/{SIDE}/fingertip_poses",     PoseArray,         16,   _tip_quat),
-    ("10_hand_paxini_ft",        f"/paxini/{SIDE}/ft",                Float32MultiArray, 12,   _fma),
-    ("11_hand_paxini_raw",       f"/paxini/{SIDE}/raw",               Float32MultiArray, 1524, _fma),
-    # ── 로봇 암 ──
-    ("12_franka_Arm_j_pos",      "/franka/right/joint_states",        JointState,        7,    _js_pos),
-    ("13_franka_Arm_j_tar",      "/franka/right/target_joint_states", JointState,        7,    _js_pos),
-    ("14_franka_Arm_j_vel",      "/franka/right/joint_states",        JointState,        7,    _js_vel),
-    ("15_franka_Arm_j_tq",       "/franka/right/joint_states",        JointState,        7,    _js_eff),
-    ("16_franka_Arm_C_pos",      "/franka/right/ee_pose",             PoseStamped,       3,    _ps_pos),
-    ("17_franka_Arm_C_quat",     "/franka/right/ee_pose",             PoseStamped,       4,    _ps_quat),
-    ("18_franka_Arm_tar_pos",    "/franka/right/ee_target_world",     PoseStamped,       3,    _ps_pos),
-    ("19_franka_Arm_tar_quat",   "/franka/right/ee_target_world",     PoseStamped,       4,    _ps_quat),
-    ("20_franka_Arm_speed_factor", "/franka/right/speed_factor",      Float64,           1,    _f64),
-    # ── 글러브 ──
-    ("21_glove_g_pos",           f"/glove/{SIDE}/q_raw",              Float32MultiArray, 16,   _fma),
-    ("22_glove_paxini_ft",       f"/glove/paxini/{SIDE}/ft",          Float32MultiArray, 12,   _fma),
-    ("23_glove_paxini_raw",      f"/glove/paxini/{SIDE}/raw",         Float32MultiArray, 1524, _fma),
-    # ── 과일 ──
+    ("10_franka_Arm_j_pos",      "/franka/right/joint_states",        JointState,        7,    _js_pos),
+    ("11_franka_Arm_j_tar",      "/franka/right/target_joint_states", JointState,        7,    _js_pos),
+    ("12_franka_Arm_j_vel",      "/franka/right/joint_states",        JointState,        7,    _js_vel),
+    ("13_franka_Arm_C_pos",      "/franka/right/ee_pose",             PoseStamped,       3,    _ps_pos),
+    ("14_franka_Arm_j_tq",       "/franka/right/joint_states",        JointState,        7,    _js_eff),
+    ("15_franka_Arm_speed_factor", "/franka/right/speed_factor",      Float64,           1,    _f64),
+    ("16_glove_g_pos",           f"/glove/{SIDE}/q_raw",              Float32MultiArray, 16,   _fma),
+    ("20_paxini_ft",             f"/paxini/{SIDE}/ft",                Float32MultiArray, 12,   _fma),
+    ("21_paxini_raw",            f"/paxini/{SIDE}/raw",               Float32MultiArray, 1524, _fma),
+    ("22_franka_Arm_C_quat",     "/franka/right/ee_pose",             PoseStamped,       4,    _ps_quat),
+    ("23_franka_Arm_tar_pos",    "/franka/right/ee_target_world",     PoseStamped,       3,    _ps_pos),
+    ("24_franka_Arm_tar_quat",   "/franka/right/ee_target_world",     PoseStamped,       4,    _ps_quat),
     ("30_fruit_pos",             "/fruit/pose",                       PoseStamped,       3,    _ps_pos),
     ("31_fruit_quat",            "/fruit/pose",                       PoseStamped,       4,    _ps_quat),
     ("32_fruit_size",            "/fruit/size",                       Float32MultiArray, 3,    _fma),
-    ("33_fruit_type",            "/fruit/type",                       Int32,             1,    _f64),
-    ("34_fruit_corners",         "/inhand/bbox_corners",              Float32MultiArray, 24,   _fma),   # 8코너 OBB (원천)
 ]
-# /fruit/type_name(String) 은 float 배열에 못 담아 Demo_N attrs["fruit_type_name"] 으로 남긴다.
-# /fruit/reset, /fruit/set_type 은 사람이 보내는 명령 토픽이라 상태 데이터가 아니라서 제외.
 
 SENSOR_QOS = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                         history=HistoryPolicy.KEEP_LAST, depth=1)
@@ -154,20 +133,14 @@ class Recorder(Node):
         self.t_demo_start = 0.0
         self.f = None
         self.out_path = None                      # 파일은 첫 에피소드 시작 때 생성
-        self.img_root = None                      # <h5 stem>_image/ (JPEG 저장 폴더)
         self.roll_req = False                     # k 키 → 파일 롤오버 요청 (키 스레드가 세팅)
         self.create_subscription(Bool, "/record/enable", self._on_enable, 10)
-
-        # 과일 종류 이름("lemon" 등)은 문자열이라 float 데이터셋에 못 넣는다 → Demo_N attrs 로.
-        self.fruit_type_name = ""
-        self.create_subscription(String, "/fruit/type_name",
-                                 lambda m: setattr(self, "fruit_type_name", m.data), SENSOR_QOS)
 
         # ── RGB: 고유 프레임만 모으고 스텝별로는 인덱스만 기록 ──
         self.rgb = rgb
         self.rgb_every = max(1, rgb_every)        # N장마다 1장만 저장(용량 절감)
         self.rgb_frames: list[bytes] = []         # 이 에피소드의 고유 JPEG 프레임
-        self.rgb_t = []                           # 수신 시각 (perf_counter, 51_real_time_global 과 동일 시계)
+        self.rgb_t = []                           # 수신 시각 (perf_counter, 19_real_time_global 과 동일 시계)
         self.rgb_stamp = []                       # 카메라 캡처 시각 (ROS header stamp)
         self._rgb_msg = None                      # 마지막 수신 프레임 (bytes, t_recv, stamp)
         self._rgb_seq = 0                         # 수신 카운터 (새 프레임 판별)
@@ -249,10 +222,10 @@ class Recorder(Node):
             return
         row = self._snapshot()
         now = time.perf_counter()
-        row["50_real_time_demo"] = np.array(now - self.t_demo_start, dtype=np.float64)
-        row["51_real_time_global"] = np.array(now, dtype=np.float64)
+        row["18_real_time_demo"] = np.array(now - self.t_demo_start, dtype=np.float64)
+        row["19_real_time_global"] = np.array(now, dtype=np.float64)
         if self.rgb:
-            row["40_image"] = np.array(self._rgb_index_for_tick(), dtype=np.int32)
+            row["41_rgb_index"] = np.array(self._rgb_index_for_tick(), dtype=np.int32)
         self.buffer.append(row)
 
     def _open_file(self):
@@ -270,19 +243,16 @@ class Recorder(Node):
         self.f.attrs["rate_hz"] = RATE_HZ
         self.f.attrs["side"] = SIDE
         self.f.attrs["start_time"] = datetime.now().isoformat()
-        # 시계 앵커: 51_real_time_global 은 perf_counter(프로세스 기준 단조시계)라 이 값만으로는
+        # 시계 앵커: 19_real_time_global 은 perf_counter(프로세스 기준 단조시계)라 이 값만으로는
         # 다른 프로세스·머신·rosbag 과 대조할 수 없다. 두 시계를 나란히 찍어 오프라인 변환이 되게 한다.
         #   wall_clock ≈ t0_unix + (perf - t0_perf)
         self.f.attrs["t0_perf"] = time.perf_counter()
         self.f.attrs["t0_unix"] = time.time()
         if self.rgb:
-            # JPEG 폴더는 h5 와 같은 경로에 <h5 이름>_image (h5 를 옮기면 같이 옮겨야 한다)
-            self.img_root = self.out_path.with_name(self.out_path.stem + "_image")
             # 카메라 메타를 파일에 남겨 나중에 재투영/디코딩에 쓸 수 있게 한다
             self.f.attrs["rgb"] = True
             self.f.attrs["rgb_topic"] = RGB_TOPIC
             self.f.attrs["rgb_every"] = self.rgb_every
-            self.f.attrs["image_dir"] = self.img_root.name
             for k, v in self.rgb_meta.items():
                 self.f.attrs[f"rgb_{k}"] = v
         self.get_logger().info(f"새 파일: {self.out_path.name}")
@@ -334,6 +304,7 @@ class Recorder(Node):
         if not self.buffer:
             self.get_logger().warn(f"<<< Demo_{self.demo_idx}: 수집된 step 없음 → 건너뜀")
             return
+        import h5py
         n = len(self.buffer)
         grp = self.f.create_group(f"Demo_{self.demo_idx}")
         keys = list(self.buffer[0].keys())
@@ -347,24 +318,22 @@ class Recorder(Node):
             grp.create_dataset(k, data=data, chunks=chunks, compression="gzip",
                                compression_opts=4, shuffle=True)
         grp.attrs["n_samples"] = n
-        grp.attrs["fruit_type_name"] = self.fruit_type_name   # 33_fruit_type 의 사람이 읽는 이름
 
         rgb_note = ""
         if self.rgb:
-            # 이미지는 h5 밖 <h5 stem>_image/Demo_N/000000.jpg 로 나가고, h5 에는 번호만 남는다.
-            # 40_image   : 스텝(N)별로 그 시점에 보이던 파일 번호 (-1 = 아직 프레임 없음) — _tick 이 채움
-            # 41_rgb_time : 수신 시각(perf_counter) — 51_real_time_global 과 같은 시계라 바로 정렬 가능
-            # 42_rgb_stamp: 카메라 캡처 시각(ROS header) — 전송 지연 확인용
-            # (41/42 은 스텝이 아니라 "파일 번호" 축이다: 41_rgb_time[40_image[step]])
-            demo_dir = self.img_root / f"Demo_{self.demo_idx}"
-            demo_dir.mkdir(parents=True, exist_ok=True)
+            # 40_rgb_jpeg: 고유 JPEG 프레임(가변길이). 이미 압축된 데이터라 gzip 은 걸지 않는다.
+            # 41_rgb_index: 스텝(N)별로 40 의 어느 프레임을 보고 있는지 (-1 = 아직 없음)
+            # 42_rgb_time : 수신 시각(perf_counter) — 19_real_time_global 과 같은 시계라 바로 정렬 가능
+            # 43_rgb_stamp: 카메라 캡처 시각(ROS header) — 전송 지연 확인용
+            vlen = h5py.vlen_dtype(np.uint8)
+            ds = grp.create_dataset("40_rgb_jpeg", (len(self.rgb_frames),), dtype=vlen)
             for i, b in enumerate(self.rgb_frames):
-                (demo_dir / f"{i:06d}.jpg").write_bytes(b)
-            grp.create_dataset("41_rgb_time", data=np.asarray(self.rgb_t, dtype=np.float64))
-            grp.create_dataset("42_rgb_stamp", data=np.asarray(self.rgb_stamp, dtype=np.float64))
+                ds[i] = np.frombuffer(b, dtype=np.uint8)
+            grp.create_dataset("42_rgb_time", data=np.asarray(self.rgb_t, dtype=np.float64))
+            grp.create_dataset("43_rgb_stamp", data=np.asarray(self.rgb_stamp, dtype=np.float64))
             mb = sum(len(b) for b in self.rgb_frames) / 1e6
             grp.attrs["n_rgb_frames"] = len(self.rgb_frames)
-            rgb_note = f", RGB {len(self.rgb_frames)}장 {mb:.1f}MB → {demo_dir.name}/"
+            rgb_note = f", RGB {len(self.rgb_frames)}장 {mb:.1f}MB"
         self.f.flush()
         self.get_logger().info(
             f"<<< 저장 Demo_{self.demo_idx}  ({n} step, {n/RATE_HZ:.1f}s{rgb_note})")
@@ -387,11 +356,8 @@ class Recorder(Node):
             m = self.rgb_meta
             info = (f"{m.get('width','?')}x{m.get('height','?')} {m.get('format','?')}"
                     if m else "메타 없음")
-            print(f"  {ok:14s} {'40_image':28s} <- {RGB_TOPIC}")
+            print(f"  {ok:14s} {'40_rgb_jpeg':28s} <- {RGB_TOPIC}")
             print(f"  {'':14s} {'':28s}    {self._rgb_n_recv}장 수신 / 3초, {info}")
-        ok = "✓" if self.fruit_type_name else "✗ (수신 없음)"
-        print(f"  {ok:14s} {'attrs fruit_type_name':28s} <- /fruit/type_name"
-              f"  (수신 {self.fruit_type_name!r})")
         print("=========================\n")
         raise KeyboardInterrupt
 
@@ -416,8 +382,7 @@ def main():
     ap = argparse.ArgumentParser(description="ROS2 구독형 HDF5 레코더 (글러브 데모 수집)")
     ap.add_argument("--check", action="store_true", help="3초간 수신 토픽 점검 후 종료")
     ap.add_argument("--rgb-on", action="store_true",
-                    help="RGB 도 저장. <h5 이름>_image/Demo_N/000000.jpg 로 나가고 "
-                         "h5 에는 스텝별 파일 번호(40_image)만 남는다 (재인코딩 없음)")
+                    help="RGB(JPEG) 도 저장. 카메라가 이미 JPEG 이라 재인코딩 없이 그대로 담는다")
     ap.add_argument("--rgb-topic", default=RGB_TOPIC, help=f"RGB 토픽 (기본 {RGB_TOPIC})")
     ap.add_argument("--rgb-every", type=int, default=1,
                     help="N장마다 1장만 저장(용량 절감). 1=전부(≈30Hz), 2=15Hz, 3=10Hz")

@@ -1,0 +1,7 @@
+# ══ 05 · [축3 생성기] DP-CNN → DiT ════════════════════════════════════════
+# adaLN-Zero 조건화. refer/ 스윕에서 U-Net 과 0.5% 차이였다(= 유의미하지 않음).
+_base_: 01_anchor.yaml
+
+model:
+  denoiser: dit
+  denoiser_kwargs: {d_model: 256, n_head: 4, n_layer: 4}

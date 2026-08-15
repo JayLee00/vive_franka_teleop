@@ -1,0 +1,40 @@
+# ══ 12 · v2 데이터 기준선 (refer/ 재현 + 과일 방향) ═══════════════════════
+# 10_baseline_refer 와 같은 "통짜 obs → MLP 하나" 구조. 바뀐 것은 데이터뿐:
+#   - 2026-08-07 스키마 (20_paxini_ft → 10_hand_paxini_ft)
+#   - 과일 방향 31_fruit_quat(4) 추가 → obs 46 → 50
+# diffusion_policy/runs/v2_base 와 같은 조건이라 두 구현을 직접 비교할 수 있다.
+_base_: _base.yaml
+
+obs_spec:
+  state:
+    kind: state
+    keys: ["03_hand_j_pos", "06_hand_j_kin", "10_hand_paxini_ft",
+           "30_fruit_pos", "31_fruit_quat", "32_fruit_size"]
+    shape: 50
+    horizon: 2
+    stride: 5
+    encoder: mlp
+
+model:
+  fusion: passthrough
+  fusion_kwargs: {}
+  denoiser: unet1d
+  denoiser_kwargs:
+    channels: [64, 128, 256]
+  head: diffusion
+  head_kwargs:
+    diff_steps: 100
+    infer_steps: 10
+
+data:
+  clamp_spec:
+    exp_20260807_031811_lemon_wo_object.h5:
+      {0: null, 1: null, 2: null, 3: null, 4: null, 5: DELETE, 6: null,
+       7: null, 8: null, 9: null, 10: null, 11: null, 12: null, 13: null}
+    exp_20260807_035756_lemon_wo_object_2.h5:
+      {0: DELETE, 1: null, 2: null, 3: null, 4: null, 5: null,
+       6: null, 7: null, 8: null, 9: null, 10: null, 11: null}
+
+train:
+  epochs: 400
+  lr: 3.0e-4

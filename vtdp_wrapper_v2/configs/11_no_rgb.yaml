@@ -1,0 +1,51 @@
+# ══ 11 · RGB 가 없을 때의 진입점 ══════════════════════════════════════════
+# 레코더의 RGB 저장은 --rgb-on **opt-in** 이라 기존 데모에 40_rgb_jpeg 가 없을 수 있다
+# (refer/ros2_hdf5_recorder.py:384). 그러면 01~09 는 전부 못 돈다.
+# 그 경우 **재수집을 기다리지 말고 이걸 돌린다.**
+#
+# `10_baseline_refer` 와 **타이밍·키·데이터가 완전히 같고** 차이는 딱 하나다:
+#   10 : 46차원 통짜 obs → 공유 MLP 하나            (모달리티 구분 없음)
+#   11 : state(34) / tactile(12) 분리 + 손가락 4토큰 (부위·시간축 보존)
+# 그래서 이 둘의 차이가 곧 **"모달리티 분리 + 손가락 토큰이 실제로 값을 하는가"** 의 답이다.
+# RGB 가 없는 세계에서 가장 값진 실험이고, 시각 없이도 끝까지 갈 수 있는 경로다.
+#
+#   state   stride 5, horizon 2 → offsets [-5, 0]   lookback 50ms
+#   tactile stride 5, horizon 2 → offsets [-5, 0]   lookback 50ms  (일치)
+#   action  stride 5, horizon 16                    refer/ 검증값
+#
+# 주파수 비율 축을 얹으려면 tactile 만 촘촘히 하고 **lookback 을 맞춘다**:
+#   1:2 → horizon 3, stride 2 는 (3-1)*2=4 ≠ 5 라 안 맞는다. stride 5 를 10 으로 올리거나
+#   (히스토리가 길어진다) 그냥 07/08 처럼 rgb 격자(stride 6)로 통일하는 게 낫다.
+#   timing_table 이 lookback 불일치를 경고하니 반드시 눈으로 확인할 것.
+_base_: _base.yaml
+
+obs_spec:
+  state:
+    kind: state
+    keys: ["03_hand_j_pos", "06_hand_j_kin", "30_fruit_pos", "32_fruit_size"]
+    shape: 34
+    horizon: 2
+    stride: 5
+    encoder: mlp
+  tactile:
+    kind: tactile
+    keys: ["20_paxini_ft"]
+    shape: 12
+    horizon: 2
+    stride: 5
+    encoder: lstm
+    encoder_kwargs:
+      n_part: 4              # ⚠️ 4손가락 x 3축 가정. inspect_h5.py 의 [레이아웃 추정] 으로
+                             #    확인하고, N x 6 이면 n_part = shape/6 으로 고칠 것.
+      return_seq: true
+
+model:
+  fusion: concat
+  fusion_kwargs: {pool: flatten}   # mean 으로 뭉개면 손가락 토큰이 그 자리에서 사라진다
+  denoiser: unet1d
+  denoiser_kwargs:
+    channels: [64, 128, 256]
+  head: diffusion
+  head_kwargs:
+    diff_steps: 100
+    infer_steps: 10

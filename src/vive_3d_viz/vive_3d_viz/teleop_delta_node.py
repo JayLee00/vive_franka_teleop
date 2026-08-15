@@ -7,7 +7,7 @@ at the engage instant.
 Two outputs:
   (a) std_msgs/String JSON on /teleop/delta/<arm> (left|right) — the raw delta,
       for local monitors / debug (see payload below).
-  (b) geometry_msgs/PoseStamped on /franka_<r|l>/ee_target_world — the ABSOLUTE
+  (b) geometry_msgs/PoseStamped on /franka/<right|left>/ee_target_world — the ABSOLUTE
       EE target the new control PC wants (see docs/VIVE_PC_HANDOFF.md). The delta
       is computed here (we generate it), so we convert to the absolute target in
       the same node instead of round-tripping the JSON through ROS2.
@@ -19,7 +19,7 @@ Delta convention (anchor-local relative transform  dT = A^-1 . T(t)):
     rot = axis-angle(dq)           # rotvec [rad], |rot| = angle, dir = axis
 
 Absolute EE target (control-PC contract). On the engage rising edge we also
-capture the current real EE pose T_ee0 = (p_ee0, R_ee0) from /franka/ee_pose_<r|l>:
+capture the current real EE pose T_ee0 = (p_ee0, R_ee0) from /franka/<right|left>/ee_pose:
     R_rel = R_align . dR . R_align^T          # tracker rotation -> robot frame
     p_rel = ee_scale . (R_align . dp_raw)     # tracker translation -> robot frame [m]
     R_target = R_ee0 . R_rel
@@ -147,7 +147,8 @@ class ArmState:
 
 
 class TeleopDeltaNode(Node):
-    ARM_SUFFIX = {'right': 'r', 'left': 'l', 'r': 'r', 'l': 'l'}
+    ARM_SUFFIX = {'right': 'r', 'left': 'l', 'r': 'r', 'l': 'l'}      # frame_id 용 (fr3_link0_<r|l>)
+    ARM_SIDE = {'right': 'right', 'left': 'left', 'r': 'right', 'l': 'left'}  # 토픽 용 (per-side)
 
     def __init__(self) -> None:
         super().__init__('vive_teleop_delta')
@@ -223,12 +224,13 @@ class TeleopDeltaNode(Node):
                 String, f'/teleop/delta/{arm}', delta_qos)
 
             suffix = self.ARM_SUFFIX.get(arm)
-            if self.publish_ee_target and suffix is not None:
+            side = self.ARM_SIDE.get(arm)
+            if self.publish_ee_target and side is not None:
                 self.create_subscription(
-                    PoseStamped, f'/franka/ee_pose_{suffix}',
+                    PoseStamped, f'/franka/{side}/ee_pose',
                     lambda msg, a=arm: self._on_ee_pose(a, msg), ee_qos)
                 self.ee_target_pubs[arm] = self.create_publisher(
-                    PoseStamped, f'/franka_{suffix}/ee_target_world', target_qos)
+                    PoseStamped, f'/franka/{side}/ee_target_world', target_qos)
                 self.target_frame[arm] = f'fr3_link0_{suffix}'
 
         self.timer = self.create_timer(1.0 / self.rate_hz, self._tick)
@@ -236,7 +238,7 @@ class TeleopDeltaNode(Node):
             f'teleop_delta up: arms={self.arms} rate={self.rate_hz:.0f}Hz '
             f'pos_scale={self.pos_scale} ee_target={self.publish_ee_target} '
             f'ee_scale={self.ee_scale} -> /teleop/delta/<arm> (JSON) + '
-            f'/franka_<r|l>/ee_target_world (PoseStamped). '
+            f'/franka/<right|left>/ee_target_world (PoseStamped). '
             f'Engage: ros2 topic pub -1 /teleop/engage/<arm> std_msgs/Bool "{{data: true}}"'
         )
 
@@ -300,7 +302,7 @@ class TeleopDeltaNode(Node):
                 st.p_ee0 = None
                 st.R_ee0 = None
                 self.get_logger().warn(
-                    f'[{arm}] ENGAGED but no fresh /franka/ee_pose_{self.ARM_SUFFIX[arm]}; '
+                    f'[{arm}] ENGAGED but no fresh /franka/{self.ARM_SIDE[arm]}/ee_pose; '
                     f'EE target disabled until re-engage')
         else:
             self.get_logger().info(f'[{arm}] ENGAGED (anchor captured)')
